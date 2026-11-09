@@ -393,6 +393,7 @@ if walking through the list starts you find a predecessor that was already fopun
     INNER JOIN [Account].[ExperienceTransfer] AS ttExpTransPrev     ON ttExpTransPrev.[ExperienceTransferID] = ttAcq.[ExperienceTransferID]
     INNER JOIN [Configuration].[TransferType] AS ttTransferTypePrev ON ttTransferTypePrev.[TransferTypeID] = ttExpTransPrev.[TransferTypeID]
     WHERE 
+        -- only going one DEEP so SuccessorEmployerID = @AnchorEmployerID
         (@AnchorEmployerID IS NULL OR ttAcq.[SuccessorEmployerID] = @AnchorEmployerID)
         AND ttTransferTypePrev.[Code] IN (SELECT [ValidTransferType] FROM @ValidTransferTypes)
         AND ttAcq.[CreatedDate] < @MaxCreatedAcquistions
@@ -712,6 +713,7 @@ PRINT 'REMOVE @ttAcquistions SuccessorEmployerID or PredecessorEmployerID if in 
 ---- Stopwatch Interval 
 IF @SW=1 INSERT INTO @SW_Stopwatch SELECT 'REMOVE @ttAcquistions SuccessorEmployerID or PredecessorEmployerID if in [CurrentStatusExclude] :: ' + CAST(@FiscalYear AS VARCHAR), @SW_Interval, SYSDATETIME(), @SW_Cnt, DATEDIFF_BIG(MS, @SW_Interval, SYSDATETIME()) OPTION (RECOMPILE); SET @SW_Interval = SYSDATETIME(); SET @SW_Cnt = NULL;
 
+-- @ttAcqEmployers will include the employers that we are interested in
 DECLARE @ttAcqEmployers TABLE 
 (
      [AnchorEmployerId]                 INT
@@ -1415,7 +1417,7 @@ WHERE 1=1
 
 ) AS TTDATA
 WHERE 1=1
-  AND TTDATA.[EffectiveDate] < TTDATA.[RcptEffCutoffDate]
+  AND TTDATA.[EffectiveDate] <= TTDATA.[RcptEffCutoffDate]
   AND TTDATA.[RcptRqstRank]  = 1 
   AND TTDATA.[RcptAllocRank] = 1
   AND ((TTDATA.[IsPartial]   = 1 AND TTDATA.[Year] < Year(TTDATA.[AcquisitionDate])) OR TTDATA.[Year] < TTDATA.[FiscalYear])
@@ -3919,7 +3921,7 @@ SELECT -- ttTransferExpData
     0.00 AS [TotalPayRollTimely2],
     0.00 AS [TotalPayRoll2],
 
-    CASE WHEN ttAcqEmployers.[IsPartial] = 1 THEN YEAR(ttAcqEmployers.[AcquisitionDate]) - 2 ELSE ttAcqEmployers.[FiscalYear] - 2 END AS [Year3],
+    CASE WHEN ttAcqEmployers.[IsPartial] = 1 THEN YEAR(ttAcqEmployers.[AcquisitionDate]) - 2 ELSE ttAcqEmployers.[FiscalYear] - 3 END AS [Year3],
     0.00 AS [TaxablePayRollTimely3],
     0.00 AS [TaxablePayRoll3],
     0.00 AS [TotalPayRollTimely3],
