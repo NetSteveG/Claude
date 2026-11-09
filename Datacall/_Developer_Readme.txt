@@ -1,122 +1,126 @@
-
 # File Structure
 
 DATACALL/
 │
-├── CLAUDE.md
+├── Claude.md
 │
-├── DATACALL_AgedCreditReport/
-│   ├── CLAUDE.md
-│   ├── dbo.DATACALL_AgedCreditReport.sql
-│   ├── dbo.DATACALL_AgedCreditReport_Screenshot.png
-│   ├── dbo.DATACALL_AgedCreditReport_UserInstructions.md
-│   └── dbo.DATACALL_AgedCreditReport_UserInstructions.pdf
+├── [dbo].[DATACALL_AgedCreditReport]/
+│   ├── Claude.md
+│   ├── [dbo].[DATACALL_AgedCreditReport].sql
+│   ├── [dbo].[DATACALL_AgedCreditReport]_Screenshot.png
+│   ├── [dbo].[DATACALL_AgedCreditReport]_UserInstructions.md
+│   └── [dbo].[DATACALL_AgedCreditReport]_UserInstructions.pdf
 │
-├── DATACALL_LedgerReport/
-│   ├── CLAUDE.md
-│   ├── dbo.DATACALL_LedgerReport.sql
-│   ├── dbo.DATACALL_LedgerReport_Screenshot.png
-│   ├── dbo.DATACALL_LedgerReport_UserInstructions.md
-│   └── dbo.DATACALL_LedgerReport_UserInstructions.pdf
+└── [dbo].[DATACALL_Ledger_FundActivity]/
+    └── [dbo].[DATACALL_Ledger_FundActivity].sql
 
-How it works:
-- Root CLAUDE.md: instructions that apply to every report.
-- Report folder CLAUDE.md: instructions specific to that report.
-- SQL file: actual SQL implementation.
-- Markdown file: master user documentation.
-- PDF: published documentation.
-- Screenshot: actual application interface.
+Report folders normally contain the following artifacts:
 
-# How Claude should interpret your folder structure
+- A report-level Claude.md instruction file.
+- The SQL implementation.
+- A screenshot of the user interface.
+- Markdown user instructions.
+- A published PDF of the user instructions.
 
-Structure establishes a clear hierarchy.
+Existing reports may omit an artifact when it is not applicable. Missing artifacts should not be created unless explicitly requested.
 
-The important principle is that when Claude works on the Aged Credit Report, it should follow:
-1. Root DATACALL/CLAUDE.md for general rules.
-2. DATACALL_AgedCreditReport/CLAUDE.md for report-specific rules.
-3. The SQL file for actual implementation.
-4. The screenshot for the actual interface.
-5. The Markdown documentation for user-facing instructions.
+## How the Files Work
 
+- The root `Claude.md` contains instructions that apply to every report.
+- A report-level `Claude.md`, when present, contains report-specific instructions.
+- The SQL file is the authoritative source for report implementation and business logic.
+- The Markdown file is the authoritative source for user-facing documentation.
+- The PDF is the published version of the Markdown documentation.
+- The screenshot represents the actual application interface and available controls.
 
-Claude Code automatically discovers applicable CLAUDE.md files in its directory hierarchy. Opening the DATACALL folder as your project root 
-makes the root instructions available, and the nested report instructions apply when working in that report's directory. You can also verify 
-what instructions Claude has loaded by asking it to explain its current project instructions.
+## How Claude Should Interpret the Folder Structure
 
-#. Instruction loading
+When working on a report:
 
-There is a small but important nuance to how Claude Code handles nested instructions.
+1. Apply the general rules in the root `Claude.md`.
+2. Apply the report-specific rules in the report folder's `Claude.md`, when present.
+3. Review the SQL file to understand the implementation, parameters, filters, calculations, and output.
+4. Review the Markdown user instructions for user-facing behavior and documentation.
+5. Use the screenshot as a reference for the actual application interface.
+6. Treat the PDF as the published documentation, not as the master document.
 
-When you open DATACALL as the project folder:
-- The root CLAUDE.md is loaded at session startup.
-- The report-level CLAUDE.md is loaded when Claude accesses files in that report's folder.
-- Instructions are combined, not substituted. The report-level instructions supplement the root instructions.
+Claude Code automatically discovers applicable Claude instruction files in its directory hierarchy. Opening the `DATACALL` folder as the project root makes the root instructions available, and nested report instructions apply when working in the relevant report folder.
 
-You can verify loaded instructions using /context in Claude Code. 
+## Instruction Loading
 
-# Interact with Claude Code
+When `DATACALL` is opened as the project folder:
+
+- The root `Claude.md` is loaded at session startup.
+- A report-level `Claude.md` is loaded when Claude accesses files in that report's folder.
+- Instructions are combined, not substituted. Report-level instructions supplement the root instructions.
+
+You can verify loaded instructions using `/context` in Claude Code.
+
+## Interact with Claude Code
 
 Establish a consistent workflow for every report maintenance request.
 
-Here are some prompts you can use directly.
-
-A. Before making a change
+### A. Before Making a Change
 
 I need to modify this report.
 
 First, review all associated files, including:
-- CLAUDE.md
-- SQL script
-- Screenshot
-- User instructions
+
+- The applicable root and report-level `Claude.md` instruction files.
+- The SQL script.
+- The screenshot, when present.
+- The Markdown user instructions, when present.
+- The PDF, when present.
 
 Do not modify anything yet.
 
-Explain how the report currently works and
-identify the areas that may be affected by
-the requested change.
+Explain how the report currently works and identify the areas that may be affected by the requested change.
 
 Ask questions if anything is unclear.
 
-B. Implementing a change
+### B. Implementing a Change
 
 Implement the requested change.
 
-Preserve existing business logic and report
-functionality unless specifically required.
-
-Modify only the necessary files.
+- Preserve existing business logic and report functionality unless specifically required.
+- Modify only the necessary files.
+- Do not execute SQL or perform SQL testing against any database environment.
+- Update documentation only when report behavior or user operation changes.
+- Do not generate or replace the PDF unless explicitly requested.
 
 After implementation, explain:
-- What changed
-- Why it changed
-- Any potential impact
-- Whether documentation needs updating
 
-Do not generate the PDF.
+- What changed.
+- Why it changed.
+- Any potential impact.
+- Whether documentation needs updating.
+- What validation was performed.
+- Any assumptions or unresolved questions.
 
-C. Reviewing the completed work
+### C. Reviewing Completed Work
 
-Review all changes made to this report.
+Review all changes made to the report.
 
-Compare the modified SQL against the original.
+Compare the modified SQL against the original and review related documentation for consistency.
 
 Look for:
-- Unintended changes to business logic
-- Missing filters or joins
-- Changes to report parameters
-- Changes to output columns
-- Potential SQL performance problems
-- Documentation inconsistencies
+
+- Unintended changes to business logic.
+- Missing filters or joins.
+- Changes to report parameters.
+- Changes to output columns, aliases, data types, or ordering.
+- Potential SQL performance problems.
+- Documentation inconsistencies.
+- Unrelated or temporary files.
 
 Do not make additional changes.
 
 Provide a review of your findings.
 
-These prompts give Claude a repeatable process rather than leaving the scope of work entirely up to its interpretation.
+These prompts provide a repeatable workflow for report maintenance.
 
-# Notes
+## Notes
 
-Make the documentation standards part of the root CLAUDE.md, and make every report's individual CLAUDE.md explicitly reference those standards.
+Documentation standards are defined in the root `Claude.md`. Each report-level `Claude.md` should explicitly reference those standards.
 
-That way, as you add 10, 20, or 50 reports to DATACALL, Claude has a consistent process for maintaining all of them.
+This structure allows additional reports to be added while maintaining consistent maintenance and documentation practices.
