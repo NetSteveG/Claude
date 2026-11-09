@@ -8,6 +8,15 @@
 --AS --- STORED PROCEDURE
 BEGIN
 
+-- Session temp tables: drop if they exist from a prior run in this session
+DROP TABLE IF EXISTS #ValidTransferTypes;
+DROP TABLE IF EXISTS #PartialTransferTypes;
+DROP TABLE IF EXISTS #BasePeriod;
+DROP TABLE IF EXISTS #BasePeriodDatePriorCommonTable;
+DROP TABLE IF EXISTS #ttAcquistions;
+DROP TABLE IF EXISTS #ttAcquistionsNotPendApp;
+DROP TABLE IF EXISTS #ttAcqEmployers;
+DROP TABLE IF EXISTS #EmpolyerSD;
 
 DECLARE @ParamFiscalYear      SMALLINT     = 2026;
 DECLARE @ParamEmployerID      INT          = 2110212048 -- 284477044 --  213373310 284476289
@@ -20,9 +29,9 @@ DECLARE @TransferTypeUC86        VARCHAR(50) = 'UC86'
 DECLARE @TransferTypeSUTAFULL    VARCHAR(50) = 'SUTAFULL'
 DECLARE @TransferTypeSUTAPARTIAL VARCHAR(50) = 'SUTAPARTIAL'
 
-DECLARE @ValidTransferTypes Table ([ValidTransferType] VARCHAR(100))
+CREATE TABLE #ValidTransferTypes ([ValidTransferType] VARCHAR(100) COLLATE DATABASE_DEFAULT)
 
-INSERT INTO @ValidTransferTypes
+INSERT INTO #ValidTransferTypes
 ----------SELECT [Code] FROM [Configuration].[TransferType] WHERE [Code] <> 'NONE' ---------- FOR TESTING
 VALUES 
  (@TransferTypeUC86)
@@ -31,9 +40,9 @@ VALUES
 
 -- Partial Transfer Type
 
-DECLARE @PartialTransferTypes Table ([PartialTransferType] VARCHAR(100))
+CREATE TABLE #PartialTransferTypes ([PartialTransferType] VARCHAR(100) COLLATE DATABASE_DEFAULT)
 
-INSERT INTO @PartialTransferTypes
+INSERT INTO #PartialTransferTypes
 ----------SELECT [Code] FROM [Configuration].[TransferType] WHERE [Code] <> 'NONE' ---------- FOR TESTING
 VALUES 
 (@TransferTypeSUTAPARTIAL)
@@ -106,8 +115,8 @@ DECLARE @Prev5QtrCounter   INT = 1;
 
 DECLARE @BasePeriodDate DATE;
 
--- @BasePeriod table is used to get the 1st 4 quarter of the prior 5 quarters of the quarter for the calandar year prior to the calandar year processing.
-DECLARE @BasePeriod TABLE 
+-- #BasePeriod table is used to get the 1st 4 quarter of the prior 5 quarters of the quarter for the calandar year prior to the calandar year processing.
+CREATE TABLE #BasePeriod 
 (
      [BasePeriodDate]            DATE
     ,[BasePeriodDateYear]        INT
@@ -134,7 +143,7 @@ BEGIN
     BEGIN
         SET @CNT = @CNT + 1
 
-        INSERT INTO @BasePeriod
+        INSERT INTO #BasePeriod
         SELECT
              @BasePeriodDate                    AS [BasePeriodDate]
             ,DATEPART(YEAR,    @BasePeriodDate) AS [BasePeriodDateYear]
@@ -151,31 +160,31 @@ BEGIN
     SET @BasePeriodCounter = @BasePeriodCounter + 1; -- INCREMENT
 END
 
-DECLARE @BasePeriodDatePriorCommonTable TABLE ([BasePeriodDatePrior] DATE)
+CREATE TABLE #BasePeriodDatePriorCommonTable ([BasePeriodDatePrior] DATE)
 
-INSERT INTO @BasePeriodDatePriorCommonTable
-SELECT TOP 1 [BasePeriodDatePrior] FROM @BasePeriod group by [BasePeriodDatePrior] HAVING COUNT(*) = 4
+INSERT INTO #BasePeriodDatePriorCommonTable
+SELECT TOP 1 [BasePeriodDatePrior] FROM #BasePeriod group by [BasePeriodDatePrior] HAVING COUNT(*) = 4
 OPTION (RECOMPILE)
 
-DECLARE @BasePeriodDatePriorCommon DATE = (SELECT TOP 1 [BasePeriodDatePrior] FROM @BasePeriodDatePriorCommonTable)
+DECLARE @BasePeriodDatePriorCommon DATE = (SELECT TOP 1 [BasePeriodDatePrior] FROM #BasePeriodDatePriorCommonTable)
 
-DECLARE @YearQtr1 INT = (SELECT    MIN([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM @BasePeriod)
-DECLARE @YearQtr2 INT = (SELECT TOP 1 ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM @BasePeriod 
+DECLARE @YearQtr1 INT = (SELECT    MIN([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM #BasePeriod)
+DECLARE @YearQtr2 INT = (SELECT TOP 1 ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM #BasePeriod 
                          WHERE        ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) > @YearQtr1
                          ORDER BY     ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]))
-DECLARE @YearQtr3 INT = (SELECT TOP 1 ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM @BasePeriod 
+DECLARE @YearQtr3 INT = (SELECT TOP 1 ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM #BasePeriod 
                          WHERE        ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) > @YearQtr2
                          ORDER BY     ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]))
-DECLARE @YearQtr4 INT = (SELECT TOP 1 ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM @BasePeriod 
+DECLARE @YearQtr4 INT = (SELECT TOP 1 ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM #BasePeriod 
                          WHERE        ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) > @YearQtr3
                          ORDER BY     ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]))
-DECLARE @YearQtr5 INT = (SELECT TOP 1 ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM @BasePeriod 
+DECLARE @YearQtr5 INT = (SELECT TOP 1 ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM #BasePeriod 
                          WHERE        ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) > @YearQtr4
                          ORDER BY     ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]))
-DECLARE @YearQtr6 INT = (SELECT TOP 1 ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM @BasePeriod 
+DECLARE @YearQtr6 INT = (SELECT TOP 1 ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM #BasePeriod 
                          WHERE        ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) > @YearQtr5
                          ORDER BY     ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]))
-DECLARE @YearQtr7 INT = (SELECT TOP 1 ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM @BasePeriod 
+DECLARE @YearQtr7 INT = (SELECT TOP 1 ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM #BasePeriod 
                          WHERE        ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) > @YearQtr6
                          ORDER BY     ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]))
 
@@ -212,7 +221,7 @@ DECLARE @PathSepBeg VARCHAR(2)     = ':'
 
 -- =================================================================
 
-DECLARE @ttAcquistions        TABLE 
+CREATE TABLE #ttAcquistions 
 (
     [RecType]               SMALLINT,
     --[BaseType]              CHAR,
@@ -229,18 +238,18 @@ DECLARE @ttAcquistions        TABLE
     [FormApplicationId]     BIGINT,
 
     -- Foreign Tables
-    [TransferType]          VARCHAR(100),
+    [TransferType]          VARCHAR(100) COLLATE DATABASE_DEFAULT,
     [IsPartial]             BIT,
 
     -- Stat Det - Liability Status - CURRENT
-    [SuccCurLiaStat]        VARCHAR(100),
-    [PredCurLiaStat]        VARCHAR(100),
+    [SuccCurLiaStat]        VARCHAR(100) COLLATE DATABASE_DEFAULT,
+    [PredCurLiaStat]        VARCHAR(100) COLLATE DATABASE_DEFAULT,
 
     -- Processing Status 
 
     [ProcStatEffDt]         DATE,
-    [ProcessCode]           VARCHAR(200),
-    [ProcessStatusCode]     VARCHAR(200),
+    [ProcessCode]           VARCHAR(200) COLLATE DATABASE_DEFAULT,
+    [ProcessStatusCode]     VARCHAR(200) COLLATE DATABASE_DEFAULT,
     [ProcStatID]            BIGINT,
     [ProcStatCreated]       DATETIME2,
 
@@ -248,19 +257,19 @@ DECLARE @ttAcquistions        TABLE
     [ProcStatRank]          BIGINT,
 
     [SuccLiaEffDate]         DATE,
-    [SuccLiaStatus]          VARCHAR (100),
+    [SuccLiaStatus]          VARCHAR (100) COLLATE DATABASE_DEFAULT,
     [SuccLiabilityDate]      DATE,
     [SuccFirstLiabilityDate] DATE,
 
     [PredLiaEffDate]         DATE,
-    [PredLiaStatus]          VARCHAR (100),
+    [PredLiaStatus]          VARCHAR (100) COLLATE DATABASE_DEFAULT,
     [PredLiabilityDate]      DATE,
     [PredFirstLiabilityDate] DATE,
 
     [NavLevel]               INT,
-    [NavPath]                VARCHAR(MAX),
+    [NavPath]                VARCHAR(MAX) COLLATE DATABASE_DEFAULT,
 
-    [CurrentStatusExclude]   VARCHAR(MAX)
+    [CurrentStatusExclude]   VARCHAR(MAX) COLLATE DATABASE_DEFAULT
 
 
     ---- Data Filled in from Employer Portal in Application Code
@@ -275,7 +284,7 @@ DECLARE @ttAcquistions        TABLE
     --[EmpFormReviewRulesCreated] DATETIME2(2),
     --[EmployerFormReviewRulesId] BIGINT,
 )
-DECLARE @ttAcquistionsNotPendApp TABLE 
+CREATE TABLE #ttAcquistionsNotPendApp 
 (
     [RecType]               SMALLINT, 
     --[BaseType]              CHAR,
@@ -292,18 +301,18 @@ DECLARE @ttAcquistionsNotPendApp TABLE
     [FormApplicationId]     BIGINT,
 
     -- Foreign Tables
-    [TransferType]          VARCHAR(100),
+    [TransferType]          VARCHAR(100) COLLATE DATABASE_DEFAULT,
     [IsPartial]             BIT,
 
     -- Stat Det - Liability Status - CURRENT
-    [SuccCurLiaStat]        VARCHAR(100),
-    [PredCurLiaStat]        VARCHAR(100),
+    [SuccCurLiaStat]        VARCHAR(100) COLLATE DATABASE_DEFAULT,
+    [PredCurLiaStat]        VARCHAR(100) COLLATE DATABASE_DEFAULT,
 
     -- Processing Status 
 
     [ProcStatEffDt]         DATE,
-    [ProcessCode]           VARCHAR(200),
-    [ProcessStatusCode]     VARCHAR(200),
+    [ProcessCode]           VARCHAR(200) COLLATE DATABASE_DEFAULT,
+    [ProcessStatusCode]     VARCHAR(200) COLLATE DATABASE_DEFAULT,
     [ProcStatID]            BIGINT,
     [ProcStatCreated]       DATETIME2,
 
@@ -311,19 +320,19 @@ DECLARE @ttAcquistionsNotPendApp TABLE
     [ProcStatRank]          BIGINT,
 
     [SuccLiaEffDate]         DATE,
-    [SuccLiaStatus]          VARCHAR (100),
+    [SuccLiaStatus]          VARCHAR (100) COLLATE DATABASE_DEFAULT,
     [SuccLiabilityDate]      DATE,
     [SuccFirstLiabilityDate] DATE,
 
     [PredLiaEffDate]         DATE,
-    [PredLiaStatus]          VARCHAR (100),
+    [PredLiaStatus]          VARCHAR (100) COLLATE DATABASE_DEFAULT,
     [PredLiabilityDate]      DATE,
     [PredFirstLiabilityDate] DATE,
 
     [NavLevel]               INT,
-    [NavPath]                VARCHAR(MAX),
+    [NavPath]                VARCHAR(MAX) COLLATE DATABASE_DEFAULT,
 
-    [CurrentStatusExclude]   VARCHAR(MAX)
+    [CurrentStatusExclude]   VARCHAR(MAX) COLLATE DATABASE_DEFAULT
 
 
     ---- Data Filled in from Employer Portal in Application Code
@@ -364,7 +373,7 @@ if walking through the list starts you find a predecessor that was already fopun
     WHERE 
         -- only going one DEEP so SuccessorEmployerID = @AnchorEmployerID
             ttAcq.[SuccessorEmployerID] = @AnchorEmployerID
-        AND ttTransferTypePrev.[Code] IN (SELECT [ValidTransferType] FROM @ValidTransferTypes)
+        AND ttTransferTypePrev.[Code] IN (SELECT [ValidTransferType] FROM #ValidTransferTypes)
         AND ttAcq.[CreatedDate] < @MaxCreatedAcquistions
 
         -- Status filters 
@@ -409,7 +418,7 @@ RecursiveCTE AS
     WHERE r.[NavPath] NOT LIKE '%,' + CAST(b.SuccessorEmployerID AS VARCHAR(20)) + ',%'
 )
 --SELECT DISTINCT * FROM RecursiveCTE OPTION (MAXRECURSION 32767);
-INSERT INTO @ttAcquistions 
+INSERT INTO #ttAcquistions 
 (
      [RecType]
       --,[BaseType]
@@ -495,7 +504,7 @@ SELECT DISTINCT
 FROM RecursiveCTE
 INNER JOIN [Account].[ExperienceTransfer] AS ttExpTrans             ON ttExpTrans.[ExperienceTransferID]   = RecursiveCTE.[ExperienceTransferID]
 INNER JOIN [Configuration].[TransferType] AS ttTransferType         ON ttTransferType.[TransferTypeID]     = ttExpTrans.[TransferTypeID]
-LEFT  JOIN @PartialTransferTypes          AS ttPartialTransferTypes ON ttPartialTransferTypes.PartialTransferType = ttTransferType.[Code]
+LEFT  JOIN #PartialTransferTypes          AS ttPartialTransferTypes ON ttPartialTransferTypes.PartialTransferType = ttTransferType.[Code]
 ) AS ttProcessStatus
 OPTION (MAXRECURSION 32767);
 
@@ -517,7 +526,7 @@ OPTION (MAXRECURSION 32767);
     INNER JOIN [Configuration].[TransferType] AS ttTransferTypePrev ON ttTransferTypePrev.[TransferTypeID] = ttExpTransPrev.[TransferTypeID]
     WHERE 
             ttAcq.[PredecessorEmployerID] = @AnchorEmployerID
-        AND ttTransferTypePrev.[Code] IN (SELECT [ValidTransferType] FROM @ValidTransferTypes)
+        AND ttTransferTypePrev.[Code] IN (SELECT [ValidTransferType] FROM #ValidTransferTypes)
         AND ttAcq.[CreatedDate] < @MaxCreatedAcquistions
 
         -- Status filters 
@@ -551,7 +560,7 @@ RecursiveCTE AS
     FROM AnchorAcq b
 )
 --SELECT DISTINCT * FROM RecursiveCTE OPTION (MAXRECURSION 32767);
-INSERT INTO @ttAcquistions 
+INSERT INTO #ttAcquistions 
 (
      [RecType]
       --,[BaseType]
@@ -637,7 +646,7 @@ SELECT DISTINCT
 FROM RecursiveCTE
 INNER JOIN [Account].[ExperienceTransfer] AS ttExpTrans             ON ttExpTrans.[ExperienceTransferID]   = RecursiveCTE.[ExperienceTransferID]
 INNER JOIN [Configuration].[TransferType] AS ttTransferType         ON ttTransferType.[TransferTypeID]     = ttExpTrans.[TransferTypeID]
-LEFT  JOIN @PartialTransferTypes          AS ttPartialTransferTypes ON ttPartialTransferTypes.PartialTransferType = ttTransferType.[Code]
+LEFT  JOIN #PartialTransferTypes          AS ttPartialTransferTypes ON ttPartialTransferTypes.PartialTransferType = ttTransferType.[Code]
 ) AS ttProcessStatus
 OPTION (MAXRECURSION 32767);
 
@@ -645,12 +654,12 @@ OPTION (MAXRECURSION 32767);
 -- PredCurLiaStat NOT IN ('ACTIVE', 'REACTIVATED', 'INACTIVE', 'TERMINATED')
 UPDATE TT SET 
   TT.[CurrentStatusExclude] = ttNotActInActTermList.[CurrentStatusExclude]
-FROM @ttAcquistions TT
+FROM #ttAcquistions TT
 INNER JOIN 
 (SELECT AnchorEmployerId, STRING_AGG(CAST(PredecessorEmployerID AS VARCHAR(20)), ',') WITHIN GROUP (ORDER BY PredecessorEmployerID) AS [CurrentStatusExclude]
    FROM (-- if the Predecessor is not in ('ACTIVE', 'REACTIVATED', 'INACTIVE', 'TERMINATED') then exclude and terminate traversing
          SELECT DISTINCT AnchorEmployerId, PredecessorEmployerID
-         FROM @ttAcquistions WHERE 1=1 AND PredCurLiaStat NOT IN ('ACTIVE', 'REACTIVATED', 'INACTIVE', 'TERMINATED')
+         FROM #ttAcquistions WHERE 1=1 AND PredCurLiaStat NOT IN ('ACTIVE', 'REACTIVATED', 'INACTIVE', 'TERMINATED')
          ) AS DistinctPreds GROUP BY AnchorEmployerId
 ) AS ttNotActInActTermList ON ttNotActInActTermList.[AnchorEmployerId] = TT.[AnchorEmployerId]
 OPTION (RECOMPILE);
@@ -658,7 +667,7 @@ OPTION (RECOMPILE);
 -- REMOVE: SuccessorEmployerID or PredecessorEmployerID if in [CurrentStatusExclude]
 -- Will Exclude if not in NOT IN ('ACTIVE', 'REACTIVATED', 'INACTIVE', 'TERMINATED')
 DELETE A
-FROM @ttAcquistions AS A
+FROM #ttAcquistions AS A
 CROSS APPLY STRING_SPLIT(A.[CurrentStatusExclude], ',') AS ttExclude
 WHERE 
     -- Traversing means that a Successor was one a predecessor so check both
@@ -666,21 +675,21 @@ WHERE
     OR TRY_CAST(ttExclude.value AS INT) = A.[PredecessorEmployerID]
 OPTION (RECOMPILE);
 
--- @ttAcqEmployers will include the employers that we will be processed
-DECLARE @ttAcqEmployers TABLE 
+-- #ttAcqEmployers will include the employers that we will be processed
+CREATE TABLE #ttAcqEmployers 
 (
      [AnchorEmployerId]                 INT
     ,[AcquisitionID]                    BIGINT
     ,[AcquisitionDate]                  DATE
     ,[SutaCutoffYear]                   SMALLINT
     ,[AcquisitionCreated]               DATETIME2(2)
-    ,[TransferType]                     VARCHAR(100)
+    ,[TransferType]                     VARCHAR(100) COLLATE DATABASE_DEFAULT
     ,[IsPartial]                        BIT
 
     ,[SuccessorEmployerID]              INT
     ,[PredecessorEmployerID]            INT
     ,[NavLevel]                         INT
-    ,[NavPath]                          VARCHAR(MAX)
+    ,[NavPath]                          VARCHAR(MAX) COLLATE DATABASE_DEFAULT
 
     -- Processing Parameters
     ,[FirstYearFy]                               SMALLINT
@@ -698,7 +707,7 @@ DECLARE @ttAcqEmployers TABLE
 )
 
 -- PredecessorEmployerID is the employer that is being acquired by the SuccessorEmployerID
-INSERT INTO @ttAcqEmployers
+INSERT INTO #ttAcqEmployers
 SELECT DISTINCT 
      ttAcquistions.[AnchorEmployerId]
     ,ttAcquistions.[AcquisitionID]
@@ -726,12 +735,12 @@ SELECT DISTINCT
     ,NULL AS [MaxPriorYearBenChgCreatedCutoffUtcFYPrior]
     ,NULL AS [TaxQtrCreatedCutoffUtc]
 
-  FROM @ttAcquistions AS ttAcquistions
+  FROM #ttAcquistions AS ttAcquistions
   WHERE 1=1
 OPTION (RECOMPILE)
 
 -- [Account].[Employer] -- The Aanchor employer data 
-INSERT INTO @ttAcqEmployers
+INSERT INTO #ttAcqEmployers
 SELECT 
      ttEmp.[EmployerID] -- [AnchorEmployerId]
     ,NULL -- ttAcqPredecessors.[AcquisitionID]
@@ -768,12 +777,12 @@ WHERE 1=1
 OPTION (RECOMPILE)
 
 -- Employer Status Determination -- The current status of the employer
-DECLARE @EmpolyerSD TABLE
+CREATE TABLE #EmpolyerSD
 (
      EmployerID               INT
     ,StatusDeterminationID    BIGINT
-    ,LiaStatus                VARCHAR(100)
-    ,FinMeth                  VARCHAR(100)
+    ,LiaStatus                VARCHAR(100) COLLATE DATABASE_DEFAULT
+    ,FinMeth                  VARCHAR(100) COLLATE DATABASE_DEFAULT
     ,EffDt                    DATE
     ,EffEndDt                 DATE
     ,ReActivation581Liability DATE
@@ -807,8 +816,9 @@ DECLARE @EmpolyerSD TABLE
             ,CAST(MIN(ttSDRank.[ReActivation581Liability]) AS DATE)         AS [ReActivation581Liability]
             ,CAST(MIN(ttSDRank.[CovEffDate])               AS DATE)         AS [CovEffDate]
             ,CAST(MIN(ttSDRank.[StatDetCreatedUtc])        AS DATETIME2(2)) AS [StatDetCreatedUtc]
-            ,ROW_NUMBER() OVER (PARTITION BY ttSDRank.[EmployerID] ORDER BY MIN(ttSDRank.[EffDt]) DESC) AS [StatDetRank]
-            ,ROW_NUMBER() OVER (PARTITION BY ttSDRank.[EmployerID] ORDER BY MIN(ttSDRank.[EffDt]) ASC)  AS [StatDetOrder]
+            -- Tie-break on CreatedDate, then StatusDeterminationID, to match the "current status" lookups (EffectiveDate, CreatedDate, StatusDeterminationID)
+            ,ROW_NUMBER() OVER (PARTITION BY ttSDRank.[EmployerID] ORDER BY MIN(ttSDRank.[EffDt]) DESC, MIN(ttSDRank.[StatDetCreatedUtc]) DESC, ttSDRank.[StatusDeterminationID] DESC) AS [StatDetRank]
+            ,ROW_NUMBER() OVER (PARTITION BY ttSDRank.[EmployerID] ORDER BY MIN(ttSDRank.[EffDt]) ASC,  MIN(ttSDRank.[StatDetCreatedUtc]) ASC,  ttSDRank.[StatusDeterminationID] ASC)  AS [StatDetOrder]
         FROM (
             SELECT 
                 ttSDOrder.[StatusDeterminationID],
@@ -824,12 +834,23 @@ DECLARE @EmpolyerSD TABLE
                     ELSE DateAdd(DAY, -1, LEAD(ttSDOrder.[EffectiveDate], 1, '9999-12-31') OVER (PARTITION BY ttSDOrder.[EmployerID] ORDER BY ttSDOrder.[EffectiveDate], ttSDOrder.[CreatedDate], ttSDOrder.[StatusDeterminationID]))
                 END AS DATE) AS [EffEndDt],
                 CAST(CASE 
-                    WHEN ttSDOrder.[CoverageEffectiveDate] IS NULL AND ttSDOrder.[LiaStatus]     IN ('ACTIVE', 'REACTIVATED') AND LAG(ttSDOrder.[LiaStatus], 1, '') OVER (PARTITION BY ttSDOrder.[EmployerID] ORDER BY ttSDOrder.[EffectiveDate], ttSDOrder.[CreatedDate], ttSDOrder.[StatusDeterminationID]) NOT IN ('ACTIVE', 'REACTIVATED') 
+                    WHEN ttSDOrder.[CoverageEffectiveDate] IS NULL AND ttSDOrder.[LiaStatus]     IN ('ACTIVE', 'REACTIVATED') 
+                     AND LAG(ttSDOrder.[LiaStatus], 1, '') 
+                         OVER (PARTITION BY ttSDOrder.[EmployerID] 
+                         ORDER BY ttSDOrder.[EffectiveDate], ttSDOrder.[CreatedDate], ttSDOrder.[StatusDeterminationID]) NOT IN ('ACTIVE', 'REACTIVATED') 
                     THEN ttSDOrder.[EffectiveDate] 
-                    WHEN ttSDOrder.[CoverageEffectiveDate] IS NOT NULL AND ttSDOrder.[LiaStatus] IN ('ACTIVE', 'REACTIVATED') AND LAG(ttSDOrder.[LiaStatus], 1, '') OVER (PARTITION BY ttSDOrder.[EmployerID] ORDER BY ttSDOrder.[EffectiveDate], ttSDOrder.[CreatedDate], ttSDOrder.[StatusDeterminationID]) NOT IN ('ACTIVE', 'REACTIVATED')
+                    WHEN ttSDOrder.[CoverageEffectiveDate] IS NOT NULL AND ttSDOrder.[LiaStatus] IN ('ACTIVE', 'REACTIVATED') 
+                     AND LAG(ttSDOrder.[LiaStatus], 1, '') 
+                         OVER (PARTITION BY ttSDOrder.[EmployerID] 
+                         ORDER BY ttSDOrder.[EffectiveDate], ttSDOrder.[CreatedDate], ttSDOrder.[StatusDeterminationID]) NOT IN ('ACTIVE', 'REACTIVATED')
                     THEN ttSDOrder.[CoverageEffectiveDate] 
-                    WHEN ttSDOrder.[CoverageEffectiveDate] IS NULL AND ttSDOrder.[LiaStatus]     IN ('ACTIVE', 'REACTIVATED') AND LAG(ttSDOrder.[LiaStatus], 1, '') OVER (PARTITION BY ttSDOrder.[EmployerID] ORDER BY ttSDOrder.[EffectiveDate], ttSDOrder.[CreatedDate], ttSDOrder.[StatusDeterminationID])  IN ('ACTIVE', 'REACTIVATED')
-                    THEN LAG(ttSDOrder.[CoverageEffectiveDate], 1) OVER (PARTITION BY ttSDOrder.[EmployerID] ORDER BY ttSDOrder.[EffectiveDate], ttSDOrder.[CreatedDate], ttSDOrder.[StatusDeterminationID])
+                    WHEN ttSDOrder.[CoverageEffectiveDate] IS NULL AND ttSDOrder.[LiaStatus]     IN ('ACTIVE', 'REACTIVATED') 
+                     AND LAG(ttSDOrder.[LiaStatus], 1, '') 
+                         OVER (PARTITION BY ttSDOrder.[EmployerID] 
+                         ORDER BY ttSDOrder.[EffectiveDate], ttSDOrder.[CreatedDate], ttSDOrder.[StatusDeterminationID])  IN ('ACTIVE', 'REACTIVATED')
+                    THEN LAG(ttSDOrder.[CoverageEffectiveDate], 1) 
+                         OVER (PARTITION BY ttSDOrder.[EmployerID]  
+                         ORDER BY ttSDOrder.[EffectiveDate], ttSDOrder.[CreatedDate], ttSDOrder.[StatusDeterminationID])
                 END AS DATE) AS [ReActivation581Liability],
                 ttSDOrder.[CoverageEffectiveDate] AS [CovEffDate],
                 ttSDOrder.[CreatedDate]           AS [StatDetCreatedUtc]
@@ -850,7 +871,7 @@ DECLARE @EmpolyerSD TABLE
                         MIN(ttSD0.[CoverageEffectiveDate]) AS [CovEffDt1st], 
                         MIN(ttSD0.[EffectiveDate])         AS [EffDt1st]
                     FROM [Account].[StatusDetermination] AS ttSD0
-                    JOIN @ttAcqEmployers                   AS ttAcqEmployers 
+                    JOIN #ttAcqEmployers                   AS ttAcqEmployers 
                       ON ttAcqEmployers.[PredecessorEmployerID] = ttSD0.[EmployerID] 
                       OR ttAcqEmployers.[SuccessorEmployerID]   = ttSD0.[EmployerID]
                       OR ttAcqEmployers.[AnchorEmployerId]      = ttSD0.[EmployerID]
@@ -876,12 +897,12 @@ DECLARE @EmpolyerSD TABLE
             ,ttSDRank.[FinMeth]
     ) AS ttStatus
 ) -- CTE_SuccSD
-INSERT INTO @EmpolyerSD 
+INSERT INTO #EmpolyerSD 
 SELECT * FROM CTE_SuccSD
 OPTION (RECOMPILE);
 
 -- Rank the Acquistions.... 
-INSERT INTO @ttAcquistions
+INSERT INTO #ttAcquistions
 SELECT 
     ttAcqRecType_1.*
 FROM (
@@ -944,16 +965,16 @@ SELECT
     ttSuccSD.[LiaStatus]  AS [SuccLiaStatus],
 
     CASE WHEN ttSuccSD.[CovEffDate] IS NOT NULL THEN ttSuccSD.[CovEffDate]
-         ELSE (SELECT TOP 1 XX.[CovEffDate] FROM @EmpolyerSD AS XX WHERE XX.[EmployerID] = ttSuccSD.[EmployerID] AND XX.[StatDetRank] > ttSuccSD.[StatDetRank] ORDER BY XX.[StatDetRank])   
+         ELSE (SELECT TOP 1 XX.[CovEffDate] FROM #EmpolyerSD AS XX WHERE XX.[EmployerID] = ttSuccSD.[EmployerID] AND XX.[StatDetRank] > ttSuccSD.[StatDetRank] ORDER BY XX.[StatDetRank])   
          END AS [SuccLiabilityDate],
-    (SELECT MIN(XX.[CovEffDate]) FROM @EmpolyerSD AS XX WHERE XX.[EmployerID] = ttSuccSD.[EmployerID] AND XX.[CovEffDate] IS NOT NULL) [SuccFirstLiabilityDate],
+    (SELECT MIN(XX.[CovEffDate]) FROM #EmpolyerSD AS XX WHERE XX.[EmployerID] = ttSuccSD.[EmployerID] AND XX.[CovEffDate] IS NOT NULL) [SuccFirstLiabilityDate],
 
     ttPredSD.[EffDt]      AS [PredLiaEffDate],
     ttPredSD.[LiaStatus]  AS [PredLiaStatus],
     CASE WHEN ttPredSD.[CovEffDate] IS NOT NULL THEN ttPredSD.[CovEffDate]
-         ELSE (SELECT TOP 1 XX.[CovEffDate] FROM @EmpolyerSD AS XX WHERE XX.[EmployerID] = ttPredSD.[EmployerID] AND XX.[StatDetRank] > ttPredSD.[StatDetRank] ORDER BY XX.[StatDetRank])   
+         ELSE (SELECT TOP 1 XX.[CovEffDate] FROM #EmpolyerSD AS XX WHERE XX.[EmployerID] = ttPredSD.[EmployerID] AND XX.[StatDetRank] > ttPredSD.[StatDetRank] ORDER BY XX.[StatDetRank])   
          END AS [PredLiabilityDate],
-    (SELECT MIN(XX.[CovEffDate]) FROM @EmpolyerSD AS XX WHERE XX.[EmployerID] = ttPredSD.[EmployerID] AND XX.[CovEffDate] IS NOT NULL) [PredFirstLiabilityDate],
+    (SELECT MIN(XX.[CovEffDate]) FROM #EmpolyerSD AS XX WHERE XX.[EmployerID] = ttPredSD.[EmployerID] AND XX.[CovEffDate] IS NOT NULL) [PredFirstLiabilityDate],
 
     ttAcqProcess.[NavLevel],
     ttAcqProcess.[NavPath],
@@ -991,7 +1012,7 @@ SELECT
     ttAcq.[NavPath],
     ttAcq.[CurrentStatusExclude]
     
-FROM @ttAcquistions AS ttAcq
+FROM #ttAcquistions AS ttAcq
   LEFT  JOIN [Account].[ProcessStatus]            AS ttProcStat ON ttProcStat.[ProcessId]            = ttAcq.[AcquisitionID]
          AND ttProcStat.[CreatedDate] < @MaxAcqProcUtc -- @CreatedDateCutoffUtc
   LEFT  JOIN [Configuration].[ProcessDefinition]  AS ttProcDefn ON ttProcDefn.[ProcessDefinitionId]  = ttProcStat.[ProcessDefinitionId]
@@ -1002,8 +1023,8 @@ FROM @ttAcquistions AS ttAcq
 WHERE 1=1
   AND ttAcq.[RecType] = 0
 ) ttAcqProcess
-  LEFT JOIN @EmpolyerSD AS ttSuccSD ON ttSuccSD.[EmployerID] = ttAcqProcess.[SuccessorEmployerID]   AND ttSuccSD.[StatDetRank] = 1
-  LEFT JOIN @EmpolyerSD AS ttPredSD ON ttPredSD.[EmployerID] = ttAcqProcess.[PredecessorEmployerID] AND ttPredSD.[StatDetRank] = 1
+  LEFT JOIN #EmpolyerSD AS ttSuccSD ON ttSuccSD.[EmployerID] = ttAcqProcess.[SuccessorEmployerID]   AND ttSuccSD.[StatDetRank] = 1
+  LEFT JOIN #EmpolyerSD AS ttPredSD ON ttPredSD.[EmployerID] = ttAcqProcess.[PredecessorEmployerID] AND ttPredSD.[StatDetRank] = 1
 ) AS ttAcqRecType_1
 WHERE 1=1
 order by
@@ -1019,24 +1040,24 @@ OPTION (RECOMPILE);
 -- -- DENIED DENIEDUI DENIEDER
 
 -- Keep the most recent APPROVED Process Status 
-DELETE FROM @ttAcquistions 
+DELETE FROM #ttAcquistions 
 WHERE [RecType] = 0 OR ([RecType] = 1 AND [ProcStatRank] != 1) --OR [ProcessStatusCode] NOT IN  ('APPROVED', 'PENDING', 'PENDINGUI', 'PENDINGER')
 OPTION (RECOMPILE);
 
 -- Hold Onto Not Pending or Approved 
-INSERT INTO @ttAcquistionsNotPendApp
-SELECT * FROM @ttAcquistions
+INSERT INTO #ttAcquistionsNotPendApp
+SELECT * FROM #ttAcquistions
 WHERE [ProcessStatusCode] NOT IN  ('APPROVED', 'PENDING', 'PENDINGUI', 'PENDINGER')
 OPTION (RECOMPILE);
 
 -- Keep the most recent APPROVED Process Status 
-DELETE FROM @ttAcquistions 
+DELETE FROM #ttAcquistions 
 WHERE [ProcessStatusCode] NOT IN  ('APPROVED', 'PENDING', 'PENDINGUI', 'PENDINGER')
 OPTION (RECOMPILE);
 
 
 -- Re-Rank the Acquistions.... 
-INSERT INTO @ttAcquistions
+INSERT INTO #ttAcquistions
 SELECT 
     0 AS [RecType],
     --[BaseType],
@@ -1109,14 +1130,14 @@ SELECT
     [NavPath],
 
     [CurrentStatusExclude]   
-FROM @ttAcquistions
+FROM #ttAcquistions
 OPTION (RECOMPILE);
 
--- Set the SUTA Cutoff Date on temp table @ttAcquistions
+-- Set the SUTA Cutoff Date on temp table #ttAcquistions
 
 UPDATE TT SET
      [SutaCutoffYear] = CAST(YEAR(TT.[AcquisitionDate]) AS SMALLINT) + 3
-FROM @ttAcquistions      AS TT 
+FROM #ttAcquistions      AS TT 
 WHERE 1=1
   AND TT.[TransferType] = @TransferTypeSUTAFULL
   AND TT.[SutaCutoffYear] != CAST(YEAR(TT.[AcquisitionDate]) AS SMALLINT) + 3
