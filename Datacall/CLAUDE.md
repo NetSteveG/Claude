@@ -10,6 +10,10 @@ Each SQL report has its own folder containing:
 - Markdown user instructions
 - PDF user instructions
 
+Each report normally contains all four artifacts. Existing reports may omit
+an artifact when it is not applicable. Do not create a missing artifact unless
+explicitly requested.
+
 ## General Rules
 
 1. Preserve existing SQL functionality unless
@@ -47,28 +51,34 @@ Never treat the PDF as the master document.
 
 ## SQL Safety and Change Control
 
-1. Never execute SQL against a production database.
-2. Never modify database objects directly.
-3. Treat SQL scripts as source code, not commands to execute.
-4. Do not change stored procedure parameters, result
-   columns, aliases, or data types without explicit approval.
-5. Preserve existing report output and business logic
+1. Never execute SQL against any database environment.
+2. Never perform SQL testing against production, non-production, development, or local database environments.
+3. Never modify database objects directly.
+4. Treat SQL scripts as source code, not commands to execute.
+5. Validate SQL changes only through static review, syntax inspection without execution, documentation review, and comparison of the changed source.
+6. Do not change stored procedure parameters, result
+   columns, aliases, data types, column order, sort order,
+   or output formatting without explicit approval.
+7. Preserve existing report output and business logic
    unless the requested change requires otherwise.
-6. Do not remove existing filters, joins, calculations,
+8. Do not remove existing filters, joins, calculations,
    or validation logic without explaining the impact.
-7. Identify potential performance implications of SQL changes.
-8. Do not assume that a successful SQL syntax review
-   proves the report produces correct results.
+9. Identify potential performance implications of SQL changes.
+10. Do not assume that a successful SQL syntax review
+    proves the report produces correct results.
 
 ## Change Review
 
 Before modifying a SQL file:
 
 1. Read the existing SQL.
-2. Read the associated report CLAUDE.md.
-3. Review the associated user documentation.
-4. Identify the requested change and affected functionality.
-5. Explain the proposed changes before implementation
+2. Confirm the correct report folder and identify its SQL script,
+   screenshot, Markdown User Instructions file, PDF, and any
+   report-level instruction file.
+3. Read the associated report-level instruction file, when present.
+4. Review the associated user documentation.
+5. Identify the requested change and affected functionality.
+6. Explain the proposed changes before implementation
    when the change is substantial.
 
 After modifying a SQL file:
@@ -79,6 +89,8 @@ After modifying a SQL file:
 4. Identify documentation updates that are necessary.
 5. Report any validation that was performed.
 6. Identify anything that still requires manual testing.
+7. Identify assumptions, unresolved questions, and items requiring
+   confirmation from the report owner.
 
 ## Report Documentation Standards
 
@@ -101,12 +113,16 @@ The SQL script header must contain a well-organized summary documenting:
 - Processing overview.
 - Important business rules and calculations.
 - Data selection, filtering, and allocation logic.
-- Temporary tables and their purposes.
+- Temporary tables and their purposes, when temporary tables are used.
 - Report output layout and column descriptions.
-- Example EXEC statements.
+- Example EXEC statements, when applicable.
 
-The User instructions section within the SQL summary must describe the report parameters, their purpose, accepted values, defaults, 
-and how the user operates the report.
+Document each applicable item based on the report's implementation. If an item
+does not apply, it may be omitted.
+
+The User instructions section within the SQL summary must describe the report
+parameters, their purpose, accepted values, defaults, and how the user operates
+the report.
 
 Maintain this section whenever SQL changes affect report functionality or user-facing behavior.
 
@@ -145,6 +161,21 @@ Not every section must appear if it is not relevant to a particular report.
 - Preserve existing documentation organization and formatting conventions.
 - When SQL functionality changes, review both the SQL Summary and Markdown documentation for consistency.
 
+### Validation Guidance
+
+Validation must not execute SQL or connect to any database environment.
+
+Permitted validation may include:
+
+- Reviewing the SQL for syntax and logic changes without executing it.
+- Comparing the changed SQL with the previous implementation.
+- Verifying parameters, output columns, aliases, data types, filters, and calculations by inspection.
+- Reviewing the Markdown documentation for consistency with the SQL.
+- Identifying application or database testing that must be performed separately by an authorized human.
+
+Document the validation performed and identify any testing that still requires
+manual verification.
+
 ### Documentation Maintenance Workflow
 
 When a report is modified:
@@ -164,36 +195,55 @@ When a report is modified:
 - Preserve the Markdown document's organization, tables, examples, and formatting.
 - Never edit the PDF independently of the Markdown source.
 
-## Standard Report Documentation Format
+## Standard User Documentation Format
 
-The **Aged Credit Report UserInstructions.md** is the master example for the organization, formatting, writing style, and level of 
-detail expected in user documentation for all DATACALL reports.
+The
+`[dbo].[DATACALL_AgedCreditReport]_UserInstructions.md` file is the current reference
+for the organization, formatting, writing style, and level of detail
+expected in user documentation for all DATACALL reports.
 
-When creating or updating documentation for any report:
+Before creating or substantially revising a report's Markdown user-instructions
+file:
 
-- Use the Aged Credit Report UserInstructions.md as the required formatting and organizational template.
-- Follow its overall structure, heading hierarchy, tables, examples, explanations, FAQs, and user-friendly writing style.
-- Maintain a consistent appearance and organization across all report documentation.
-- Adapt sections to the functionality of the individual report. Not every report will require every section.
-- Do not create a new documentation format or substantially change the established style without explicit direction.
-- Do not copy report-specific content, parameters, or business rules from the Aged Credit Report into other reports.
-- Preserve the established style while accurately documenting each report's unique functionality.
+1. Read the Aged Credit Report documentation:
+   `Datacall\[dbo].[DATACALL_AgedCreditReport]\[dbo].[DATACALL_AgedCreditReport]_UserInstructions.md`
+2. Use it as the reference for:
+   - Document organization
+   - Heading structure
+   - Formatting
+   - Tables
+   - Examples
+   - Explanations
+   - Frequently asked questions
+3. Maintain a consistent writing style and presentation across reports.
+4. Adapt the structure to the functionality of the individual report.
+   Not every report requires every section.
+5. Preserve the established documentation style unless explicitly
+   instructed otherwise.
+6. Do not copy report-specific content, parameters, or business rules
+   from the Aged Credit Report into another report.
+7. Base all report-specific content on the corresponding SQL
+   implementation and verified application behavior.
+8. Do not invent application functionality, parameters, business rules,
+   or expected results.
 
-Before creating a new report's UserInstructions.md, review the Aged Credit Report UserInstructions.md and use it as the starting 
-point for the document's organization and presentation.
+The Aged Credit Report documentation is a formatting and organizational
+template only. It is not a source of business rules or report-specific
+functionality.
 
-## Required User Documentation Template
+## Instruction Precedence
 
-The Aged Credit Report UserInstructions.md is the standard reference and formatting template for all DATACALL report user documentation.
+Instructions in this file apply to all reports.
 
-Before creating or substantially revising a report's UserInstructions.md:
+A report-level `CLAUDE.md` may add or specialize these instructions, but it must not contradict this file unless the exception is explicitly documented in the report-level instructions.
 
-1. Read the Aged Credit Report UserInstructions.md:
-   `DATACALL_AgedCreditReport/dbo.DATACALL_AgedCreditReport_UserInstructions.md`
-2. Use it as the reference for document organization, heading structure, formatting, tables, examples, explanations, and FAQs.
-3. Maintain a consistent writing style and presentation across all reports.
-4. Adapt the structure as appropriate for the functionality of the individual report.
-5. Do not invent a different documentation style or substantially change the established format without explicit direction.
+### Source-Control Review
 
-The Aged Credit Report document is a formatting and organizational template, not a source of business rules or report-specific 
-functionality. All report-specific content must be based on the corresponding SQL implementation and verified application behavior.
+Before completing a change:
+
+1. Review the Git diff.
+2. Confirm that no unrelated files were changed.
+3. Confirm that generated PDFs or other generated files are included only
+   when intentionally requested.
+4. Remove or exclude temporary files.
+5. Confirm that the final change matches the requested scope.

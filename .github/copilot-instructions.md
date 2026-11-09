@@ -1,0 +1,7 @@
+# Copilot Instructions
+
+## Project Guidelines
+- Use `Claude.md` casing in documentation and recommendations instead of `CLAUDE.md` when referring to Claude instruction files.
+- SQL scripts in the Datacall repository must not be executed against any database environment unless execution is explicitly authorized; they are treated as source code, not commands to run.
+- For the SQL report maintenance project, never execute SQL or perform SQL testing against any database environment, including non-production. Validation must be limited to static review and other non-execution checks.
+- Report folders normally contain the SQL script, screenshot, Markdown instructions, and PDF. Existing reports may omit an artifact when not applicable; missing artifacts must not be created unless requested. Before modifying a report, confirm its folder and all related files, including any report-level instruction file. Update documentation only when report behavior or user operation changes. Review git diff for unrelated or temporary files. Preserve stored procedure and report output compatibility, including ordering and formatting, and report assumptions or unresolved questions.
