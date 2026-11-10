@@ -80,6 +80,10 @@ DECLARE @Component_PAYMENT_PREDECESSOR       VARCHAR(50) = 'PAYMENT_PREDECESSOR'
 DECLARE @Component_BENEFITCHARGE_PREDECESSOR VARCHAR(50) = 'BENEFITCHARGE_PREDECESSOR'
 DECLARE @Component_PREDECESSOR               VARCHAR(50) = 'PREDECESSOR'
 
+-- Step timing (elapsed milliseconds printed after each step)
+DECLARE @StepStart                           DATETIME2(7)
+DECLARE @StepRows                            INT
+
 CREATE TABLE #Employers_PREDECESSORS  
 (
     [EmployerID]            INT, 
@@ -117,6 +121,9 @@ WHERE 1=1
 OPTION (RECOMPILE)
 
 CREATE TABLE #DeleteePredNotValid ([RunningReserveID] UNIQUEIDENTIFIER)
+
+SET @StepStart = SYSDATETIME()
+
 INSERT INTO #DeleteePredNotValid
 SELECT 
 	TT.[RunningReserveID] 
@@ -128,137 +135,97 @@ WHERE 1=1
   AND TTPred.[RunningReserveID]  IS NULL
   AND ((@ParamEmployerID IS NULL OR @ParamEmployerID = TT.[EmployerID]))
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #DeleteePredNotValid: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+SET @StepStart = SYSDATETIME()
 
 DELETE TT FROM [Account].[RunningReserve] AS TT JOIN #DeleteePredNotValid AS XX ON XX.[RunningReserveID] = TT.[RunningReserveID]
+
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('DELETE predecessor not valid: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
 
 -- Payments =================================================
 
 SET @Component_Type = @Component_PAYMENT
+SET @StepStart      = SYSDATETIME()
 
-MERGE INTO [Account].[RunningReserve] AS Target
-USING (
-    SELECT 
-        @Component_Type AS [Component]
-        ,0    AS [Quarter] 
+DROP TABLE IF EXISTS #RunningReserveCalcPayments;
 
-		,NULL AS [PredecessorEmployerID]
-		,NULL AS [PredLiaStatus]
-		,NULL AS [SuccessorEmployerID]
-		,NULL AS [SuccLiaStatus]
-
-        ,NULL AS [TransferType]  
-        ,NULL AS [AcquisitionDate]
-        ,NULL AS [ResponseDate]
-
-        ,ttPayments.*
-    FROM (
-    SELECT 
-         CTE_TaxesPaid.[EmployerID] 
-        ,CTE_TaxesPaid.[Year]         
-
-        ,SUM(ISNULL(CTE_TaxesPaid.[TaxesPaidRcv],    0.00)) AS [TaxesPaidRcv]
-
-        ,MAX(CTE_TaxesPaid.[MaxRcptAllocCreated])           AS [MaxRcptAllocCreated]
-        ,MAX(CTE_TaxesPaid.[MaxRcptAllocModified])          AS [MaxRcptAllocModified]
-
-        ,0.00 AS [BenefitsChargedClient]
-        ,0.00 AS [BenefitsRelievedClient]
-        ,NULL AS [MaxChargeStatementChargeCreated]
-
-    FROM (
-    -- PAYMENTS
-    SELECT 
-        --TTDATA.*
-         TTDATA.[EmployerID]
-
-        ,TTDATA.[EffectiveDate]
-
-        ,TTDATA.[DepositDate] ---------------- AS [EffectiveDate]
-    
-        ,ISNULL(TTDATA.[TaxesPaidRcv],    0.00) AS [TaxesPaidRcv]
-
-        -- Tax Quarter Year/Quarter
-        ,TTDATA.[Year]
-        ,TTDATA.[Quarter]
-
-        ,TTDATA.[MaxRcptAllocCreated]
-        ,TTDATA.[MaxRcptAllocModified]
-
-        ,TTDATA.[RcptRqstRank]
-        ,TTDATA.[RcptAllocRank]
-    FROM (
+WITH Alloc AS (
     SELECT
-        ttRcpt.[EmployerID]                   AS [EmployerID]
-
-        ,CAST((SELECT TOP 1 xxRcptEff.[EffectiveDate] 
-                          FROM [dbo].[ReceiptEffective] AS xxRcptEff 
-                          WHERE xxRcptEff.[ReceiptID] = ttRcpt.[ReceiptID] 
-                          ORDER BY xxRcptEff.[CreatedDate]) AS DATE) as [EffectiveDate]
-
-        ,ttRcpt.[DepositDate] ---------------- AS [EffectiveDate]
-    
-        ,ISNULL(ttAllocRcv.[Amount], 0.00)   AS [TaxesPaidRcv]
-
-        ,ttTaxQtrRcv.[Year]    AS [Year]
-        ,ttTaxQtrRcv.[Quarter] AS [Quarter]
-
-        ,ttRcptAlloc.[CreatedDate]  AS [MaxRcptAllocCreated]
-        ,ttRcptAlloc.[ModifiedDate] AS [MaxRcptAllocModified]
-
-
+         ttRcpt.[EmployerID]
+        ,ttTaxQtrRcv.[Year]
+        ,ttAllocRcv.[Amount]
+        ,ttRcptAlloc.[CreatedDate]  AS [AllocCreated]
+        ,ttRcptAlloc.[ModifiedDate] AS [AllocModified]
         ,DENSE_RANK() OVER (PARTITION BY ttRcpt.[ReceiptID]
-                            ORDER BY 
-                                ttRcpt.[ReceiptID]       DESC, ttRcpt.[CreatedDate]          DESC,
-                                ttRcptRqst.[CreatedDate] DESC, ttRcptRqst.[ReceiptRequestID] DESC) AS [RcptRqstRank]
-
-        ,DENSE_RANK() OVER (PARTITION BY ttRcpt.[ReceiptID]
-                            ORDER BY 
-                                ttRcpt.[ReceiptID]        DESC, ttRcpt.[CreatedDate]              DESC,
-                                ttRcptRqst.[CreatedDate]  DESC, ttRcptRqst.[ReceiptRequestID]     DESC,
-                                ttRcptAlloc.[CreatedDate] DESC, ttRcptAlloc.[ReceiptAllocationID] DESC) AS [RcptAllocRank]
-
-    FROM [dbo].[ReceiptAllocation]          AS ttRcptAlloc
-        INNER JOIN [dbo].[ReceiptRequest]   AS ttRcptRqst    ON ttRcptRqst.[ReceiptRequestID] = ttRcptAlloc.[ReceiptRequestID] 
-        INNER JOIN [dbo].[Receipt]          AS ttRcpt        ON ttRcpt.[ReceiptID]            = ttRcptRqst.[ReceiptID] 
-
-        ------LEFT JOIN @Employers                AS ttEmployers ON ttEmployers.[EmployerID] = ttRcpt.[EmployerID]
-
-        -- PAID
-        LEFT JOIN [dbo].[ReceiptAllocationReceivable] AS ttAllocRcv  ON ttAllocRcv.[ReceiptAllocationID] = ttRcptAlloc.[ReceiptAllocationID] 
-        LEFT JOIN [Account].[Receivable]              AS ttRcv       ON ttRcv.[ReceivableID]             = ttAllocRcv.[ReceivableID] 
-
-        LEFT JOIN [Account].[TaxQuarter]              AS ttTaxQtrRcv ON ttTaxQtrRcv.[TaxQuarterID]       = ttRcv.[TaxQuarterID] 
-
-        LEFT JOIN [Configuration].[ReceivableType]    AS ttRcvTyp    ON ttRcvTyp.[ReceivableTypeID]      = ttRcv.[ReceivableTypeID]
-
-    WHERE 1=1
-      ------AND ((@ParamEmployerID IS NULL OR ttEmployers.[EmployerID] = ttRcpt.[EmployerID]))
-      AND ((@ParamEmployerID IS NULL OR @ParamEmployerID = ttRcpt.[EmployerID]))
-
+                            ORDER BY ttRcptRqst.[CreatedDate]  DESC, ttRcptRqst.[ReceiptRequestID]     DESC,
+                                     ttRcptAlloc.[CreatedDate] DESC, ttRcptAlloc.[ReceiptAllocationID] DESC) AS [RcptAllocRank]
+    FROM       [dbo].[Receipt]                     AS ttRcpt
+    INNER JOIN [dbo].[ReceiptRequest]              AS ttRcptRqst  ON ttRcptRqst.[ReceiptID]           = ttRcpt.[ReceiptID]
+    INNER JOIN [dbo].[ReceiptAllocation]           AS ttRcptAlloc ON ttRcptAlloc.[ReceiptRequestID]   = ttRcptRqst.[ReceiptRequestID]
+    INNER JOIN [dbo].[ReceiptAllocationReceivable] AS ttAllocRcv  ON ttAllocRcv.[ReceiptAllocationID] = ttRcptAlloc.[ReceiptAllocationID]
+    INNER JOIN [Account].[Receivable]              AS ttRcv       ON ttRcv.[ReceivableID]             = ttAllocRcv.[ReceivableID]
+    INNER JOIN [Configuration].[ReceivableType]    AS ttRcvTyp    ON ttRcvTyp.[ReceivableTypeID]      = ttRcv.[ReceivableTypeID]
+    LEFT  JOIN [Account].[TaxQuarter]              AS ttTaxQtrRcv ON ttTaxQtrRcv.[TaxQuarterID]       = ttRcv.[TaxQuarterID]
+    WHERE ttRcpt.[EmployerID]  = @ParamEmployerID          -- sargable; NULL already handled by the early RETURN
       AND ttAllocRcv.[Amount] >= 0.00
       AND ttRcvTyp.[Code] IN ('TAXCOMPUTED', 'TAXSHAREDCOST', 'TAXOTHERSTATE')
+)
+SELECT
+     CAST(@Component_Type AS VARCHAR(50))  AS [Component]
+    ,0                                     AS [Quarter]
+    ,CAST(NULL AS INT)                     AS [PredecessorEmployerID]
+    ,CAST(NULL AS VARCHAR(100))            AS [PredLiaStatus]
+    ,CAST(NULL AS INT)                     AS [SuccessorEmployerID]
+    ,CAST(NULL AS VARCHAR(100))            AS [SuccLiaStatus]
+    ,CAST(NULL AS VARCHAR(100))            AS [TransferType]
+    ,CAST(NULL AS DATE)                    AS [AcquisitionDate]
+    ,CAST(NULL AS DATE)                    AS [ResponseDate]
+    ,[EmployerID]
+    ,[Year]
+    ,SUM([Amount])                         AS [TaxesPaidRcv]          -- Amount >= 0 so never NULL
+    ,MAX([AllocCreated])                   AS [MaxRcptAllocCreated]
+    ,MAX([AllocModified])                  AS [MaxRcptAllocModified]
+    ,CAST(0 AS MONEY)                      AS [BenefitsChargedClient]
+    ,CAST(0 AS MONEY)                      AS [BenefitsRelievedClient]
+    ,CAST(NULL AS DATETIME)                AS [MaxChargeStatementChargeCreated]
+INTO #RunningReserveCalcPayments
+FROM Alloc
+WHERE [RcptAllocRank] = 1
+  AND [Year] IS NOT NULL                   -- same as the outer filter: applied after ranking
+GROUP BY [EmployerID], [Year]
+OPTION (RECOMPILE);                        -- employer sizes vary widely; plan per call
 
-    ) AS TTDATA
-    WHERE 1=1
-      AND TTDATA.[RcptRqstRank]  = 1 
-      AND TTDATA.[RcptAllocRank] = 1
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('Build ', @Component_Type, ': ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
 
-    ) AS CTE_TaxesPaid
-    GROUP BY 
-         CTE_TaxesPaid.[EmployerID]
-        ,CTE_TaxesPaid.[Year]
-        --,CTE_TaxesPaid.[Quarter]
-    ) AS ttPayments
-    WHERE 1=1
-      AND [EmployerID]    IS NOT NULL 
-      AND [YEAR]          IS NOT NULL 
-) AS Source
+-- ======
+
+SET @Component_Type = @Component_PAYMENT
+SET @StepStart      = SYSDATETIME()
+
+SET @Component_Type = @Component_PAYMENT
+SET @StepStart      = SYSDATETIME()
+
+;WITH Target_Payment AS (
+    SELECT *
+    FROM [Account].[RunningReserve]
+    WHERE [EmployerID] = @ParamEmployerID      -- NULL already handled by the early RETURN
+      AND [Component]  = @Component_Type
+      AND [Quarter]    = 0
+)
+MERGE INTO Target_Payment AS Target
+USING #RunningReserveCalcPayments AS Source
 ON Target.[Component]             = Source.[Component]             AND 
    Target.[EmployerID]            = Source.[EmployerID]            AND 
    Target.[Year]                  = Source.[Year]                  AND
    Target.[Quarter]               = Source.[Quarter]               AND
-   Target.[PredecessorEmployerID] = Source.[PredecessorEmployerID] AND 
-   Target.[SuccessorEmployerID]   = Source.[SuccessorEmployerID]
+   (Target.[PredecessorEmployerID] = Source.[PredecessorEmployerID]
+    OR (Target.[PredecessorEmployerID] IS NULL AND Source.[PredecessorEmployerID] IS NULL)) AND
+   (Target.[SuccessorEmployerID]   = Source.[SuccessorEmployerID]
+    OR (Target.[SuccessorEmployerID]   IS NULL AND Source.[SuccessorEmployerID]   IS NULL))
 -- If a match is found, update the existing row
 WHEN MATCHED 
  AND (Target.[TaxesPaidRcv]                    != Source.[TaxesPaidRcv]                    OR
@@ -363,17 +330,21 @@ WHEN NOT MATCHED THEN
 -- If NO match is found, DELETE
 WHEN NOT MATCHED BY SOURCE 
  --------AND ((@ParamEmployerID IS NULL OR target.[EmployerID] IN (SELECT [EmployerID] FROM @Employers)))
- AND  (@ParamEmployerID IS NULL OR @ParamEmployerID = target.[EmployerId]) 
+ AND (@ParamEmployerID IS NULL OR @ParamEmployerID = target.[EmployerId]) 
  AND (@Component_Type  = target.[Component])
  AND (target.[Quarter] = 0)
 THEN
     DELETE
  -- MAXDOP 1: Force single-threaded execution
- OPTION (MAXDOP 1);
+ OPTION (MAXDOP 1, RECOMPILE);  -- RECOMPILE: plan built for this employer's actual row counts
+
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('MERGE ', @Component_Type, ': ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
 
 -- BENEFITCHARGE =================================================
 
 SET @Component_Type = @Component_BENEFITCHARGE
+SET @StepStart      = SYSDATETIME()
 
 MERGE INTO [Account].[RunningReserve] AS Target
 USING (
@@ -538,9 +509,13 @@ THEN
  -- MAXDOP 1: Force single-threaded execution
  OPTION (MAXDOP 1);
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('MERGE ', @Component_Type, ': ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
 -- Payments PREDECESSOR ==========================================
 
 SET @Component_Type = @Component_PAYMENT_PREDECESSOR
+SET @StepStart      = SYSDATETIME()
 
 MERGE INTO [Account].[RunningReserve] AS Target
 USING (
@@ -795,9 +770,13 @@ THEN
  -- MAXDOP 1: Force single-threaded execution
  OPTION (MAXDOP 1);
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('MERGE ', @Component_Type, ': ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
 -- BENEFITCHARGE PREDECESSOR =====================================
 
 SET @Component_Type = @Component_BENEFITCHARGE_PREDECESSOR
+SET @StepStart      = SYSDATETIME()
 
 MERGE INTO [Account].[RunningReserve] AS Target
 USING (
@@ -968,7 +947,12 @@ THEN
  -- MAXDOP 1: Force single-threaded execution
  OPTION (MAXDOP 1);
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('MERGE ', @Component_Type, ': ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
 -- PREDECESSOR ADJUSTMENTS =====================================
+
+SET @StepStart = SYSDATETIME()
 
 MERGE INTO [Account].[RunningReserve] AS Target
 USING (
@@ -1127,6 +1111,9 @@ THEN
     DELETE
  -- MAXDOP 1: Force single-threaded execution
  OPTION (MAXDOP 1);
+
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('MERGE PREDECESSOR ADJUSTMENTS: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
 
 
 
