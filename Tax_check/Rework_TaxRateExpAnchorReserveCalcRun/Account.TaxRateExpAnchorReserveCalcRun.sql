@@ -21,6 +21,8 @@ DROP TABLE IF EXISTS #EmplStatDet;
 DROP TABLE IF EXISTS #TaxQuartersQwrQwraLateStatus;
 DROP TABLE IF EXISTS #MissingIds;
 DROP TABLE IF EXISTS #ttTransExp;
+DROP TABLE IF EXISTS #ttTransExpPayroll;
+
 
 DECLARE @ParamFiscalYear      SMALLINT     = 2026;
 DECLARE @ParamEmployerID      INT          = 2110212048 -- 284477044 --  213373310 284476289
@@ -72,8 +74,6 @@ SELECT
     @CurrentDateLocal     = CAST(CheckUtcToLocalDateTime AS DATE),
     @CurrentDateTimeUTC   = CheckDateTime
 FROM [dbo].[DateTime_LocalUtcTranslate](GETUTCDATE())
-
-
 
 -- ====================================================================================================
 
@@ -1520,8 +1520,8 @@ OPTION (MAXDOP 1); -- Example: Force single-threaded execution
 The checking for late reports in building [Account].[TaxRateExpReserveCalc] it only checks on quarters on the base period.
 - need to look at all quarters back to the liability date. 
 
-QUICK FIX - Look at all Quarters back to Liability Date And if employer was active in any of thos quarters
-            the quarter need to have filed an Tax Quarter Report - QWR / QWRA
+QUICK FIX - Look at all Quarters back to Liability Date And if employer was active in any of those quarters
+            the quarter needs to have filed an Tax Quarter Report - QWR / QWRA
 
 */
 
@@ -1780,7 +1780,7 @@ SELECT
    AND ttTQRept.IsEnabled      = 1
    AND ttTQ.[Year]     <= @FiscalYear - 1
    AND ttTQ.[Year]     >= @FiscalYear - @NumberOfYears
-   AND  ttTQRept.[ReceivedDate] IS NOT NULL
+   AND ttTQRept.[ReceivedDate] IS NOT NULL
 
    AND (ttTQRept.[ReceivedDate] <= ttAcqEmployers.[FebMailingDateCutoff] OR ttTQ.[TaxRateTimely] = 1)
    AND ttTQRept.[ReportTypeId] IN (@ReptTypeQWR, @ReptTypeQWRA, @ReptTypeOAF)
@@ -3832,13 +3832,13 @@ WHERE 1=1
 --WHERE 1=1
 --  AND ttTransExp.[AnchorEmployerId] IS NULL
 
--- SET RESERVE 
+-- #ttTransExp SET RESERVE 
 UPDATE  TT SET
     TT.[Reserve]      = TT.[TaxesPaid]      - (TT.[BenefitsChargedClient]      - TT.[BenefitsRelievedClient]),
     TT.[PriorReserve] = TT.[TaxesPaidPrior] - (TT.[BenefitsChargedClientPrior] - TT.[BenefitsRelievedClientPrior])
 FROM #ttTransExp AS TT
 
--- Set [ClientTaxablePayroll] 
+-- #ttTransExp Set [ClientTaxablePayroll] 
 UPDATE  TT SET
     TT.[ClientTaxablePayroll] =
     CASE WHEN  TT.[IsPartial] = 0  THEN 0.00 
@@ -3856,7 +3856,7 @@ UPDATE  TT SET
             END
 FROM #ttTransExp AS TT
 
--- Set [PercentTransfer] 
+-- #ttTransExp Set [PercentTransfer] 
 UPDATE  TT SET
     TT.[PercentTransfer] =
         CASE WHEN TT.[IsPartial] = 0                                                  THEN 1.00  
@@ -3866,7 +3866,7 @@ UPDATE  TT SET
             ELSE TT.[ClientTaxablePayroll] / [TaxablePayRoll] END 
 FROM #ttTransExp AS TT
 
-DECLARE @ttTransExpPayroll TABLE
+CREATE TABLE #ttTransExpPayroll
 (
     [AnchorEmployerId]              INT,
     [EmployerID]                    INT,
@@ -3887,7 +3887,7 @@ DECLARE @ttTransExpPayroll TABLE
 
 )
 
-INSERT INTO @ttTransExpPayroll
+INSERT INTO #ttTransExpPayroll
 SELECT -- [Account].[TaxRateExpPayRoll]
     ttAcqEmployers.[AnchorEmployerId],
     ttAcqEmployers.[PredecessorEmployerID],
@@ -3916,7 +3916,7 @@ INNER JOIN [Account].[TaxRateExpPayRoll] AS ttData ON ttData.[AnchorEmployerID] 
 SELECT * FROM #ttTransExp
 
 -- #2 DATA (KEEP IN ORDER):  TransferExperiencePayroll 
-SELECT * FROM @ttTransExpPayroll
+SELECT * FROM #ttTransExpPayroll
 
 -- #3 DATA (KEEP IN ORDER):  RateTypeDetermined
 SELECT distinct
@@ -4088,19 +4088,95 @@ FROM (
 
 ) AS ttTaxRateHawaii
 
--- Session temp tables: drop if they exist from a prior run in this session
-DROP TABLE IF EXISTS #ValidTransferTypes;
-DROP TABLE IF EXISTS #PartialTransferTypes;
-DROP TABLE IF EXISTS #BasePeriod;
-DROP TABLE IF EXISTS #BasePeriodDatePriorCommonTable;
-DROP TABLE IF EXISTS #ttAcquistions;
-DROP TABLE IF EXISTS #ttAcquistionsNotPendApp;
-DROP TABLE IF EXISTS #ttAcqEmployers;
-DROP TABLE IF EXISTS #EmpolyerSD;
-DROP TABLE IF EXISTS #EmplStatDet;
-DROP TABLE IF EXISTS #TaxQuartersQwrQwraLateStatus;
-DROP TABLE IF EXISTS #MissingIds;
-DROP TABLE IF EXISTS #ttTransExp;
+-- 
+SELECT * FROM #ttTransExp;
+SELECT 
+
+
+   PriorReserve = ISNULL(TaxesPaidPrior, 0.00) - 
+                  (ISNULL(BenefitsChargedClientPrior, 0.00) - ISNULL(BenefitsRelievedClientPrior, 0.00)) +  -- BenefitsTotalClientPrior
+                  ISNULL(BenefitsTotalClientPriorAdjust, 0.00),                                             -- BenefitsTotalClientPriorAdjust
+
+   Contributions = ISNULL(TaxesPaid, 0.00),
+
+
+   Reserve       = ISNULL(TaxesPaid, 0.00) - 
+                   (ISNULL(BenefitsChargedClient, 0.00) - ISNULL(BenefitsRelievedClient, 0.00)) + -- BenefitsTotalClient
+                   ISNULL(BenefitsTotalClientAdjust, 0.00),                                       -- BenefitsTotalClientAdjust
+
+   Timely3Yr    = (ISNULL(TaxablePayRollTimelyYear1, 0.00) + ISNULL(TaxablePayRollTimelyYear2, 0.00) + ISNULL(TaxablePayRollTimelyYear3, 0.00)),
+   Timely3YrAvg = (ISNULL(TaxablePayRollTimelyYear1, 0.00) + ISNULL(TaxablePayRollTimelyYear2, 0.00) + ISNULL(TaxablePayRollTimelyYear3, 0.00)) / 3.0,
+
+   '<<< VALUES' AS 'VALUES',
+
+
+   TaxesPaid,
+   TaxesPaidPrior,
+   BenefitsChargedClient,
+   BenefitsRelievedClient,
+   BenefitsTotalClient       = ISNULL(BenefitsChargedClient, 0.00) - ISNULL(BenefitsRelievedClient, 0.00),
+
+   BenefitsTotalClientAdjust,
+   BenefitsTotalClientAdjust = ISNULL(BenefitsTotalClientAdjust, 0.00),
+
+   BenefitsChargedClientPrior,
+   BenefitsRelievedClientPrior,
+   BenefitsTotalClientPrior       = ISNULL(BenefitsChargedClientPrior, 0.00) - ISNULL(BenefitsRelievedClientPrior, 0.00),
+
+   BenefitsTotalClientPriorAdjust,
+   BenefitsTotalClientPriorAdjust = ISNULL(BenefitsTotalClientPriorAdjust, 0.00),
+
+   TaxablePayRollTimelyYear1,
+   TaxablePayRollTimelyYear2,
+   TaxablePayRollTimelyYear3,
+
+   '<<< DATA' AS 'DATA'
+FROM #ttTransExp
+
+SELECT -- [Account].[TaxRateExpTaxesPaid]
+
+     ttData.[AnchorEmployerID]
+    ,ttData.[EmployerID]
+    ,ttData.[FiscalYear]
+    ,ttData.[Year]
+    ,ttData.[Quarter]
+
+    ,ttData.[TaxesPaid]
+    ,ttData.[TaxesPaidPrior]
+
+    ,ttData.[AcquisitionID]
+    ,ttData.[IsPartial]
+FROM #ttAcqEmployers AS ttAcqEmployers
+LEFT JOIN [Account].[TaxRateExpTaxesPaid] AS ttData ON ttData.[AnchorEmployerID] = ttAcqEmployers.[AnchorEmployerID]
+        AND ttData.[EmployerID]        = ttAcqEmployers.[PredecessorEmployerID] 
+        AND ttAcqEmployers.[IsPartial] = 0
+WHERE  1=1
+    AND ttData.[AnchorEmployerId]  = @AnchorEmployerId 
+    AND ttData.[FiscalYear]        = ttAcqEmployers.[FiscalYear] 
+ORDER BY 
+     ttData.[AnchorEmployerID], 
+     ttData.[EmployerID],
+     ttData.[FiscalYear]
+    ,ttData.[Year]
+    ,ttData.[Quarter]
+
+---- Session temp tables: drop if they exist from a prior run in this session
+--DROP TABLE IF EXISTS #ValidTransferTypes;
+--DROP TABLE IF EXISTS #PartialTransferTypes;
+--DROP TABLE IF EXISTS #BasePeriod;
+--DROP TABLE IF EXISTS #BasePeriodDatePriorCommonTable;
+--DROP TABLE IF EXISTS #ttAcquistions;
+--DROP TABLE IF EXISTS #ttAcquistionsNotPendApp;
+--DROP TABLE IF EXISTS #ttAcqEmployers;
+--DROP TABLE IF EXISTS #EmpolyerSD;
+--DROP TABLE IF EXISTS #EmplStatDet;
+--DROP TABLE IF EXISTS #TaxQuartersQwrQwraLateStatus;
+--DROP TABLE IF EXISTS #MissingIds;
+--DROP TABLE IF EXISTS #ttTransExp;
+
+
+
 
 END
+
 
