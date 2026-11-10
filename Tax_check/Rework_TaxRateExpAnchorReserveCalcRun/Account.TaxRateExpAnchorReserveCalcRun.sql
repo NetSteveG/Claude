@@ -1,6 +1,4 @@
 ﻿
-
-
 --CREATE PROCEDURE [Account].[TaxRateExpAnchorReserveCalcRun]
 --    @ParamFiscalYear      SMALLINT, -- Always passed a value
 --    @ParamEmployerID      INT,  -- Always passed a value
@@ -17,6 +15,8 @@ DROP TABLE IF EXISTS #ttAcquistions;
 DROP TABLE IF EXISTS #ttAcquistionsNotPendApp;
 DROP TABLE IF EXISTS #ttAcqEmployers;
 DROP TABLE IF EXISTS #EmpolyerSD;
+DROP TABLE IF EXISTS #EmplStatDet;
+DROP TABLE IF EXISTS #TaxQuartersQwrQwraLateStatus;
 DROP TABLE IF EXISTS #MissingIds;
 DROP TABLE IF EXISTS #ttTransExp;
 
@@ -1526,9 +1526,6 @@ QUICK FIX - Look at all Quarters back to Liability Date And if employer was acti
 
 DECLARE @FirstDayOfYear DATE = DATEADD(DAY,-1, DATEFROMPARTS(@FiscalYear, 1, 1));
 
-DROP TABLE IF EXISTS #EmplStatDet;
-
-
 CREATE TABLE #EmplStatDet
 (
     [StatusDeterminationID]     BIGINT          NOT NULL,
@@ -1559,8 +1556,6 @@ DECLARE @LiabilityDateLate DATE =
         (SELECT TOP 1 f.LiabilityDate
             FROM #EmplStatDet AS f
             WHERE f.[EffDt] <= @FirstDayOfYear AND f.[EffEndDt] >= @FirstDayOfYear AND f.[EffDtRank] = 1)
-
-DROP TABLE IF EXISTS #TaxQuartersQwrQwraLateStatus
 
 ;WITH CTE_TaxQuarters AS (
 SELECT 
@@ -4091,6 +4086,19 @@ FROM (
 
 ) AS ttTaxRateHawaii
 
+-- Session temp tables: drop if they exist from a prior run in this session
+DROP TABLE IF EXISTS #ValidTransferTypes;
+DROP TABLE IF EXISTS #PartialTransferTypes;
+DROP TABLE IF EXISTS #BasePeriod;
+DROP TABLE IF EXISTS #BasePeriodDatePriorCommonTable;
+DROP TABLE IF EXISTS #ttAcquistions;
+DROP TABLE IF EXISTS #ttAcquistionsNotPendApp;
+DROP TABLE IF EXISTS #ttAcqEmployers;
+DROP TABLE IF EXISTS #EmpolyerSD;
+DROP TABLE IF EXISTS #EmplStatDet;
+DROP TABLE IF EXISTS #TaxQuartersQwrQwraLateStatus;
+DROP TABLE IF EXISTS #MissingIds;
+DROP TABLE IF EXISTS #ttTransExp;
 
 END
 
