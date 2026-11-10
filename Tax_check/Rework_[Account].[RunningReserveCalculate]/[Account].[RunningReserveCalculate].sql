@@ -1,15 +1,15 @@
 
 /****** Object:  StoredProcedure [Account].[RunningReserveCalculate]    Script Date: 11/10/2026 11:08:00 AM ******/
-SET ANSI_NULLS ON
-GO
-SET QUOTED_IDENTIFIER ON
-GO
+--SET ANSI_NULLS ON
+--GO
+--SET QUOTED_IDENTIFIER ON
+--GO
 
-CREATE OR ALTER   PROCEDURE [Account].[RunningReserveCalculate]
-    @ParamEmployerID     INT      = NULL,
-    @ParamUser           INT      = NULL
-WITH RECOMPILE
-AS --- STORED PROCEDURE
+--CREATE OR ALTER   PROCEDURE [Account].[RunningReserveCalculate]
+--    @ParamEmployerID     INT      = NULL,
+--    @ParamUser           INT      = NULL
+--WITH RECOMPILE
+--AS --- STORED PROCEDURE
 BEGIN
 
 -- Called from Tax Inquiry
@@ -61,11 +61,14 @@ The the TAX RATE RESERVE BALANCE,
 
 */
 
---DECLARE @ParamEmployerID     INT       = 213373310 -- 214546710 -- 251658810 -- 213373310 -- 63005 213373310 --
---DECLARE @ParamUser           INT       = NULL -- 63005 --
+DECLARE @ParamEmployerID     INT       = 2110212048 -- 214546710 -- 251658810 -- 213373310 -- 63005 213373310 --
+DECLARE @ParamUser           INT       = 63005 -- 63005 --
 
 IF (@ParamEmployerID IS NULL)
   RETURN
+
+DROP TABLE IF EXISTS #DeleteePredNotValid
+DROP TABLE IF EXISTS #Employers_PREDECESSORS
 
 DECLARE @CurrentUser    INT = CASE WHEN @ParamUser IS NULL THEN 0 ELSE @ParamUser END
 
@@ -77,7 +80,7 @@ DECLARE @Component_PAYMENT_PREDECESSOR       VARCHAR(50) = 'PAYMENT_PREDECESSOR'
 DECLARE @Component_BENEFITCHARGE_PREDECESSOR VARCHAR(50) = 'BENEFITCHARGE_PREDECESSOR'
 DECLARE @Component_PREDECESSOR               VARCHAR(50) = 'PREDECESSOR'
 
-DECLARE @Employers_PREDECESSORS TABLE 
+CREATE TABLE #Employers_PREDECESSORS  
 (
     [EmployerID]            INT, 
 	[PredecessorEmployerID] INT,
@@ -90,13 +93,13 @@ DECLARE @Employers_PREDECESSORS TABLE
 )
 
 -------------------- TESTING ***************************************************************************
-----------------INSERT INTO @Employers_PREDECESSORS
+----------------INSERT INTO #Employers_PREDECESSORS
 ----------------SELECT DISTINCT SuccessorEmployerID, PredecessorEmployerID
 ----------------FROM [Account].[Acquisition] 
 
-----------------SELECT COUNT(*) '@Employers_PREDECESSORS' FROM @Employers_PREDECESSORS 
+----------------SELECT COUNT(*) '#Employers_PREDECESSORS' FROM #Employers_PREDECESSORS
 
-INSERT INTO @Employers_PREDECESSORS
+INSERT INTO #Employers_PREDECESSORS
 SELECT DISTINCT 
     [EmployerID], 
 	[PredecessorEmployerID],
@@ -113,8 +116,8 @@ WHERE 1=1
   AND [Quarter]   = 0
 OPTION (RECOMPILE)
 
-DECLARE @DeleteePredNotValid TABLE ([RunningReserveID] UNIQUEIDENTIFIER)
-INSERT INTO @DeleteePredNotValid
+CREATE TABLE #DeleteePredNotValid ([RunningReserveID] UNIQUEIDENTIFIER)
+INSERT INTO #DeleteePredNotValid
 SELECT 
 	TT.[RunningReserveID] 
 FROM      [Account].[RunningReserve]  AS TT
@@ -126,7 +129,7 @@ WHERE 1=1
   AND ((@ParamEmployerID IS NULL OR @ParamEmployerID = TT.[EmployerID]))
 
 
-DELETE TT FROM [Account].[RunningReserve] AS TT JOIN @DeleteePredNotValid AS XX ON XX.[RunningReserveID] = TT.[RunningReserveID]
+DELETE TT FROM [Account].[RunningReserve] AS TT JOIN #DeleteePredNotValid AS XX ON XX.[RunningReserveID] = TT.[RunningReserveID]
 
 -- Payments =================================================
 
@@ -638,7 +641,7 @@ USING (
         INNER JOIN [dbo].[ReceiptRequest]   AS ttRcptRqst    ON ttRcptRqst.[ReceiptRequestID] = ttRcptAlloc.[ReceiptRequestID] 
         INNER JOIN [dbo].[Receipt]          AS ttRcpt        ON ttRcpt.[ReceiptID]            = ttRcptRqst.[ReceiptID] 
 
-        INNER JOIN @Employers_PREDECESSORS   AS ttEmployers_PRED ON ttEmployers_PRED.[PredecessorEmployerID] = ttRcpt.[EmployerID]
+        INNER JOIN #Employers_PREDECESSORS   AS ttEmployers_PRED ON ttEmployers_PRED.[PredecessorEmployerID] = ttRcpt.[EmployerID]
 
         -- PAID
         LEFT JOIN [dbo].[ReceiptAllocationReceivable] AS ttAllocRcv  ON ttAllocRcv.[ReceiptAllocationID] = ttRcptAlloc.[ReceiptAllocationID] 
@@ -784,7 +787,7 @@ WHEN NOT MATCHED THEN
     )
 -- If NO match is found, DELETE
 WHEN NOT MATCHED BY SOURCE 
- AND (@ParamEmployerID IS NULL OR target.[EmployerId] IN (SELECT [PredecessorEmployerID] FROM @Employers_PREDECESSORS)) 
+ AND (@ParamEmployerID IS NULL OR target.[EmployerId] IN (SELECT [PredecessorEmployerID] FROM #Employers_PREDECESSORS)) 
  AND (@Component_Type  = target.[Component])
  AND (target.[Quarter] = 0)
 THEN
@@ -823,7 +826,7 @@ SELECT
     ,MAX(ttChgStmntChg.[CreatedDate])                    AS [MaxChargeStatementChargeCreated]
 
 FROM [Account].[ChargeStatement]                              AS ttChgStmnt
-  INNER JOIN @Employers_PREDECESSORS                          AS ttEmployers_PRED      ON ttEmployers_PRED.[PredecessorEmployerID] = ttChgStmnt.[EmployerID]
+  INNER JOIN #Employers_PREDECESSORS                          AS ttEmployers_PRED      ON ttEmployers_PRED.[PredecessorEmployerID] = ttChgStmnt.[EmployerID]
   LEFT  JOIN [Account].[ChargeStatementChargeStatementCharge] AS ttChgStmntChgStmntChg ON ttChgStmntChgStmntChg.[ChargeStatementID] = ttChgStmnt.[ChargeStatementID]
   LEFT  JOIN [Account].[ChargeStatementCharge]                AS ttChgStmntChg         ON ttChgStmntChg.[ChargeStatementChargeID]   = ttChgStmntChgStmntChg.[ChargeStatementChargeID]
 
@@ -957,7 +960,7 @@ WHEN NOT MATCHED THEN
     )
 -- If NO match is found, DELETE
 WHEN NOT MATCHED BY SOURCE 
- AND (@ParamEmployerID IS NULL OR target.[EmployerId] IN (SELECT [PredecessorEmployerID] FROM @Employers_PREDECESSORS)) 
+ AND (@ParamEmployerID IS NULL OR target.[EmployerId] IN (SELECT [PredecessorEmployerID] FROM #Employers_PREDECESSORS)) 
  AND (@Component_Type  = target.[Component])
  AND (target.[Quarter] = 0)
 THEN
@@ -997,7 +1000,7 @@ SELECT
 
 FROM       [Account].[RunningReserve] rr
 INNER JOIN [Account].[RunningReserve] rrPred           on rrPred.EmployerID = rr.PredecessorEmployerID and rrPred.Component in ('PAYMENTADJUST', 'BENEFITADJUST')
-INNER JOIN @Employers_PREDECESSORS AS ttEmployers_PRED ON ttEmployers_PRED.[PredecessorEmployerID] = rr.PredecessorEmployerID
+INNER JOIN #Employers_PREDECESSORS AS ttEmployers_PRED ON ttEmployers_PRED.[PredecessorEmployerID] = rr.PredecessorEmployerID
 WHERE 1=1 
 	AND rr.Component = 'PREDECESSOR'
 ) AS Source
@@ -1117,7 +1120,7 @@ WHEN NOT MATCHED THEN
     )
 -- If NO match is found, DELETE
 WHEN NOT MATCHED BY SOURCE 
- AND (@ParamEmployerID IS NULL OR target.[EmployerId] IN (SELECT [PredecessorEmployerID] FROM @Employers_PREDECESSORS)) 
+ AND (@ParamEmployerID IS NULL OR target.[EmployerId] IN (SELECT [PredecessorEmployerID] FROM #Employers_PREDECESSORS)) 
  AND (@Component_Type  = target.[Component])
  AND (target.[Quarter] = 0)
 THEN
