@@ -145,6 +145,37 @@ DELETE TT FROM [Account].[RunningReserve] AS TT JOIN #DeleteePredNotValid AS XX 
 SET @StepRows = @@ROWCOUNT
 PRINT CONCAT('DELETE predecessor not valid: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
 
+-- Remove duplicates =========================================
+-- A MERGE fails ("attempted to UPDATE or DELETE the same row more than once") if the
+-- target holds more than one row for the same key. Keep the most recently modified row
+-- per key; the MERGEs below then recalculate its amounts.
+-- Limited to the components this procedure MERGEs. PREDECESSOR and the *ADJUST
+-- components are maintained elsewhere and are left alone.
+
+SET @StepStart = SYSDATETIME()
+
+;WITH Ranked AS (
+    SELECT [RunningReserveID],
+           ROW_NUMBER() OVER (
+               PARTITION BY [Component], [EmployerID], [Year], [Quarter],
+                            [PredecessorEmployerID], [SuccessorEmployerID]   -- PARTITION BY treats NULLs as equal
+               ORDER BY [ModifiedDate] DESC, [CreatedDate] DESC, [RunningReserveID] DESC
+           ) AS rn
+    FROM [Account].[RunningReserve]
+    WHERE [EmployerID] = @ParamEmployerID
+      AND [Quarter]    = 0
+      AND [Component] IN (@Component_PAYMENT, @Component_BENEFITCHARGE,
+                          @Component_PAYMENT_PREDECESSOR, @Component_BENEFITCHARGE_PREDECESSOR)
+)
+DELETE RR
+FROM [Account].[RunningReserve] AS RR
+JOIN Ranked AS R ON R.[RunningReserveID] = RR.[RunningReserveID]
+WHERE R.rn > 1
+OPTION (RECOMPILE);
+
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('DELETE duplicates: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
 -- Payments =================================================
 
 SET @Component_Type = @Component_PAYMENT
@@ -389,14 +420,16 @@ GROUP BY
 HAVING 1=1
   AND (SUM(ISNULL(ttChgStmntChg.[BenefitsCharged],  0.00))  != 0.00 OR 
        SUM(ISNULL(ttChgStmntChg.[BenefitsRelieved],  0.00)) != 0.00)
-  
+
 ) AS Source
-ON Target.[Component]             = Source.[Component]             AND 
-   Target.[EmployerID]            = Source.[EmployerID]            AND 
+ON Target.[Component]             = Source.[Component]             AND
+   Target.[EmployerID]            = Source.[EmployerID]            AND
    Target.[Year]                  = Source.[Year]                  AND
    Target.[Quarter]               = Source.[Quarter]               AND
-   Target.[PredecessorEmployerID] = Source.[PredecessorEmployerID] AND 
-   Target.[SuccessorEmployerID]   = Source.[SuccessorEmployerID]
+   (Target.[PredecessorEmployerID] = Source.[PredecessorEmployerID]
+    OR (Target.[PredecessorEmployerID] IS NULL AND Source.[PredecessorEmployerID] IS NULL)) AND
+   (Target.[SuccessorEmployerID]   = Source.[SuccessorEmployerID]
+    OR (Target.[SuccessorEmployerID]   IS NULL AND Source.[SuccessorEmployerID]   IS NULL))
 -- If a match is found, update the existing row
 WHEN MATCHED 
  AND (Target.[TaxesPaidRcv]                    != Source.[TaxesPaidRcv]                    OR
