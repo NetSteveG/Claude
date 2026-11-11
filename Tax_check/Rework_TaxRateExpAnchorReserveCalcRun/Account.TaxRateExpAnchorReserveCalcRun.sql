@@ -1,12 +1,165 @@
 ﻿
-
-
---CREATE PROCEDURE [Account].[TaxRateExpAnchorReserveCalcRun]
+--CREATE OR ALTER PROCEDURE [Account].[TaxRateExpAnchorReserveCalcRun]
 --    @ParamFiscalYear      SMALLINT, -- Always passed a value
---    @ParamEmployerID      INT,  -- Always passed a value
+--    @ParamEmployerID      INT       -- Always passed a value
 --WITH RECOMPILE
 --AS --- STORED PROCEDURE
 BEGIN
+
+SET NOCOUNT ON; 
+
+/* ====================================================================================================
+   PROCEDURE : [Account].[TaxRateExpAnchorReserveCalcRun]
+
+   PURPOSE
+   -------
+   Calculates the experience-rating reserve and reserve ratio for one ANCHOR employer (the employer
+   being rated) for one Fiscal (rate) Year. The Anchor's figures include experience transferred to it
+   through acquisitions (UC86 / SUTAFULL / SUTAPARTIAL). The procedure:
+     - Refreshes the [Account].[TaxRateExp*] work tables (MERGE: insert / update / delete) for the Anchor
+     - Determines the Rate Type (Max-Rate / New-Rate / Rated / Undetermined)
+     - Returns result sets that are consumed in a FIXED ORDER (see OUTPUT RESULT SETS)
+
+   PARAMETERS
+   ----------
+   @ParamFiscalYear  SMALLINT  Fiscal (rate) year being calculated             -> @FiscalYear
+   @ParamEmployerID  INT       Anchor EmployerID (NULL is treated as -1)       -> @AnchorEmployerID
+
+   SCRIPT MODE vs. PROCEDURE MODE
+   ------------------------------
+   The file can run as an ad-hoc script or be deployed as the stored procedure.
+     Script mode (current)   : CREATE OR ALTER PROCEDURE ... AS is commented out at the top of the file,
+                               and @ParamFiscalYear / @ParamEmployerID are DECLAREd below with test values.
+     Procedure mode (deploy) : Uncomment the CREATE OR ALTER PROCEDURE ... AS lines, and comment out the
+                               DECLARE @ParamFiscalYear / DECLARE @ParamEmployerID lines.
+   The BEGIN / END that wrap the body are used in both modes.
+
+   KEY SETTINGS (declared at top of script)
+   ----------------------------------------
+   @Show_Debug_Data          'Y' appends debug result sets at the end (default 'n')
+   #ValidTransferTypes       Transfer types that are followed      : UC86, SUTAFULL, SUTAPARTIAL
+   #PartialTransferTypes     Transfer types treated as PARTIAL     : SUTAPARTIAL
+   @NumberOfYears            Payroll years used for the 3-year average (3)
+   @min/@maxReserveRatio     Reserve Ratio is clamped to +/- 9999.9999
+   @FebMailingDate*          February bill-statement mailing / cutoff dates for FY and FY-1
+                             (dbo.GetFebBillStatementMailingDate / ...MailingCutoffDate)
+   @LocalTimeZone            From dbo.DateTime_LocalUtcTranslate; local cutoffs are converted to UTC
+   @Max*                     '9999-12-31' "as-of" created-date cutoffs (hooks for point-in-time reruns)
+
+   TERMINOLOGY
+   -----------
+   Anchor       The employer being rated (@AnchorEmployerID)
+   Successor    The employer that acquired another employer's experience
+   Predecessor  The employer whose experience was acquired
+   FULL         All experience transfers to the Successor             ([IsPartial] = 0)
+   PARTIAL      Only acquisition-year experience is transferred        ([IsPartial] = 1)
+                FirstYearFy = YEAR(AcquisitionDate) + 1 for partial transfers, else @FiscalYear
+   Base Period  The first 4 of the prior 5 quarters, for each quarter of the calendar year before
+                the rate year (#BasePeriod)
+
+   PROCESSING FLOW
+   ---------------
+    1. SETUP
+       - Drop or create session temp tables; load transfer-type lists
+       - Resolve local time zone, Feb mailing dates and cutoffs, Rate Type labels
+       - Build #BasePeriod (4 base periods x 4 quarters) and @YearQtr1..7
+
+    2. ACQUISITION CHAIN  (#ttAcquistions)
+       - Recursive CTE walks the acquisition chain from the Anchor as SUCCESSOR, then as PREDECESSOR
+         (NavPath / NavLevel track the walk and prevent cycles)
+       - Only valid transfer types; Successor and Predecessor must currently be
+         ACTIVE / REACTIVATED / INACTIVE / TERMINATED
+       - Excludes chains through a Predecessor whose current status is not in that list ([CurrentStatusExclude])
+
+    3. EMPLOYERS TO PROCESS  (#ttAcqEmployers)
+       - One row per acquisition, plus one row for the Anchor itself
+         (Anchor row: AcquisitionID / AcquisitionDate NULL, PredecessorEmployerID = Anchor)
+       - Loads #EmpolyerSD (flattened Status Determination per employer)
+       - Ranks the acquisitions in #ttAcquistions by Process Status and keeps the latest one;
+         removes any whose Process Status is not APPROVED / PENDING / PENDINGUI / PENDINGER, then re-ranks
+       - SUTAFULL: SutaCutoffYear = YEAR(AcquisitionDate) + 3
+       - Removes #ttAcqEmployers acquisition rows whose AcquisitionID is no longer in #ttAcquistions
+       - Fills the per-row processing parameters (FirstYearFy, cutoff dates / UTC cutoffs)
+
+    4. RESULT SET #0: acquisitions (latest Process Status per acquisition)
+
+    5. MERGE [Account].[TaxRateExpTaxesPaid]
+       - Tax payments (ReceiptAllocation -> Receivable: TAXCOMPUTED / TAXSHAREDCOST / TAXOTHERSTATE)
+         per employer / year / quarter, split into TaxesPaid (prior year) and TaxesPaidPrior (earlier years)
+       - Limited by RcptEffCutoffDate (Jan 31 of FY) and RcptCreatedCutoffUtc (Feb mailing cutoff)
+
+    6. MERGE [Account].[TaxRateExpBenChg]
+       - Benefit charges and reliefs (ChargeStatementCharge) split by CreatedDate into
+         prior-year (Client) and earlier-years (ClientPrior) buckets
+
+    7. LATE / MISSING REPORT CHECK  (#EmplStatDet -> #TaxQuartersQwrQwraLateStatus)
+       - For the Anchor: every quarter back to the liability date in which it was ACTIVE / REACTIVATED
+         needs a QWR / QWRA received by the Feb mailing cutoff (or TaxRateTimely = 1)
+       - Sets @AnyLateMissingReports
+       - Why it is separate: the late-report check inside the TaxRateExpReserveCalc build ([SUM_IsLate])
+         only looks at base-period quarters; this check covers all quarters back to the liability date
+
+    8. MERGE [Account].[TaxRateExpPayRoll]
+       - Latest QWR / QWRA / OAF report per tax quarter for FY-3..FY-1:
+         Taxable / Total payroll, plus "Timely" versions (received by the Feb cutoff or TaxRateTimely = 1)
+
+    9. MERGE [Account].[TaxRateExpReserveCalc]  (ANCHOR only)
+       - Reserve      = (TaxesPaidPrior - BenefitsTotalClientPrior) + (TaxesPaid - BenefitsTotalClient)
+                        + [Account].[RunningReserve] adjustments (PAYMENTADJUST +, BENEFITADJUST -)
+       - ReserveRatio = ROUND(Reserve / TaxablePayRollTimely3YrAvg, 4); NULL when the 3-year average
+                        <= 0; clamped to +/- 9999.9999
+       - RateTypeDetermined (first match wins):
+           Max-Rate :Late Report                       late / missing report
+           New-Rate / Max-Rate :Inactive / Not liable  4 non-rateable quarters in any base period
+                                                       (New when Reserve >= 0)
+           New-Rate / Max-Rate :$0.00 Report / ...     a base period with no non-zero-wage quarter
+                                                       (New when Reserve >= 0)
+           Max-Rate :Timely Wages <= 0.00              ReserveRatio IS NULL
+           Rated :                                     non-zero wages in all 4 base periods
+           Undetermined :                              anything else
+
+   10. MISSING ANCHOR ROW  (#MissingIds)
+       - If the MERGE produced no ReserveCalc row for the Anchor, insert one with
+         'Max-Rate :No Reserve Calc'
+
+   11. TRANSFER EXPERIENCE  (#ttTransExp, #ttTransExpPayroll)
+       - One row per Anchor / FULL / PARTIAL Predecessor, with totals from the TaxRateExp* tables
+       - Zero rows are added for acquisitions that have no data
+       - Reserve / PriorReserve; ClientTaxablePayroll from [Account].[TransferExperienceClientPayroll] (PARTIAL)
+       - PercentTransfer: FULL = 1.00; PARTIAL = ClientTaxablePayroll / TaxablePayRoll (capped 0..1)
+
+   OUTPUT RESULT SETS  (*** KEEP IN ORDER - the caller reads these by position ***)
+   ----------------------------------------------------------------------------------
+     #0  Acquisitions          #ttAcquistions where ProcStatRank = 1
+     #1  TransferExperience    #ttTransExp
+     #2  TransferExperiencePayroll   #ttTransExpPayroll (FULL / Anchor rows)
+     #3  RateTypeDetermined    Anchor row from [Account].[TaxRateExpReserveCalc]
+     #4  StatDetLiability      Flattened Status Determination with LiabilityDate
+     #5  TaxRateHawaii         [Account].[TaxRateHawaii] rows for the Anchor / Successors / Predecessors
+     --  Debug (@Show_Debug_Data = 'Y' only): #ttTransExp reserve detail, TaxesPaid detail
+
+   TABLES WRITTEN
+   --------------
+     [Account].[TaxRateExpTaxesPaid]     MERGE (deletes rows for this Anchor / FY that are no longer in the source)
+     [Account].[TaxRateExpBenChg]        MERGE (same)
+     [Account].[TaxRateExpPayRoll]       MERGE (same)
+     [Account].[TaxRateExpReserveCalc]   MERGE + INSERT (Anchor row only)
+
+   MAINTENANCE NOTES
+   -----------------
+   - Temp tables are marked "-- ==== TEMP TABLE NO LONGER UTILIZED" after their last use.
+     "** EXCEPT FOR DEBUG **" means the table is used again only in the @Show_Debug_Data block.
+   - All temp tables are dropped at the start and end of the procedure.
+   - Step timing: each step is wrapped with SET @StepStart = SYSDATETIME() ... SET @StepRows = @@ROWCOUNT
+     and PRINTs "<step>: <ms> ms, <rows> rows"; a TOTAL elapsed line prints after result set #5.
+     Keep SET @StepRows = @@ROWCOUNT IMMEDIATELY after the step's statement (any statement in between resets it).
+
+   CHANGE HISTORY
+   --------------
+   Date        Author          Description
+   ----------  --------------  ------------------------------------------------------------
+   YYYY-MM-DD  <name>          <description>
+==================================================================================================== */
 
 -- Session temp tables: drop if they exist from a prior run in this session
 DROP TABLE IF EXISTS #ValidTransferTypes;
@@ -14,7 +167,6 @@ DROP TABLE IF EXISTS #PartialTransferTypes;
 DROP TABLE IF EXISTS #BasePeriod;
 DROP TABLE IF EXISTS #BasePeriodDatePriorCommonTable;
 DROP TABLE IF EXISTS #ttAcquistions;
-DROP TABLE IF EXISTS #ttAcquistionsNotPendApp;
 DROP TABLE IF EXISTS #ttAcqEmployers;
 DROP TABLE IF EXISTS #EmpolyerSD;
 DROP TABLE IF EXISTS #EmplStatDet;
@@ -23,6 +175,12 @@ DROP TABLE IF EXISTS #MissingIds;
 DROP TABLE IF EXISTS #ttTransExp;
 DROP TABLE IF EXISTS #ttTransExpPayroll;
 
+DECLARE @Show_Debug_Data      CHAR = 'Y' -- 'Y' TO APPEND DEBUG RESULTS SET
+
+-- Step timing: each step sets @StepStart before it runs, captures @@ROWCOUNT immediately after it, and PRINTs the elapsed time
+DECLARE @ProcStart                           DATETIME2(7) = SYSDATETIME()
+DECLARE @StepStart                           DATETIME2(7)
+DECLARE @StepRows                            INT
 
 DECLARE @ParamFiscalYear      SMALLINT     = 2026;
 DECLARE @ParamEmployerID      INT          = 2110212048 -- 284477044 --  213373310 284476289
@@ -37,16 +195,23 @@ DECLARE @TransferTypeSUTAPARTIAL VARCHAR(50) = 'SUTAPARTIAL'
 
 CREATE TABLE #ValidTransferTypes ([ValidTransferType] VARCHAR(100) COLLATE DATABASE_DEFAULT)
 
+SET @StepStart = SYSDATETIME()
+
 INSERT INTO #ValidTransferTypes
 ----------SELECT [Code] FROM [Configuration].[TransferType] WHERE [Code] <> 'NONE' ---------- FOR TESTING
-VALUES 
+VALUES
  (@TransferTypeUC86)
 ,(@TransferTypeSUTAFULL)
 ,(@TransferTypeSUTAPARTIAL)
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #ValidTransferTypes: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
 -- Partial Transfer Type
 
 CREATE TABLE #PartialTransferTypes ([PartialTransferType] VARCHAR(100) COLLATE DATABASE_DEFAULT)
+
+SET @StepStart = SYSDATETIME()
 
 INSERT INTO #PartialTransferTypes
 ----------SELECT [Code] FROM [Configuration].[TransferType] WHERE [Code] <> 'NONE' ---------- FOR TESTING
@@ -63,7 +228,10 @@ VALUES
 --,('PICONVERSION')
 --,('PFCONVERSION')
 
-DECLARE @LocalTimeZone        SYSNAME -- = 'Hawaiian Standard Time'
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #PartialTransferTypes: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+DECLARE @LocalTimeZone       SYSNAME -- = 'Hawaiian Standard Time'
 DECLARE @CurrentDateLocal     DATE;
 DECLARE @CurrentDateTimeLocal DATETIME2;
 DECLARE @CurrentDateTimeUTC   DATETIME2;
@@ -134,6 +302,8 @@ CREATE TABLE #BasePeriod
 
 DECLARE @CNT INT = 1
 
+SET @StepStart = SYSDATETIME()
+
 WHILE @BasePeriodCounter <= 4
 BEGIN
     
@@ -164,13 +334,24 @@ BEGIN
     SET @BasePeriodCounter = @BasePeriodCounter + 1; -- INCREMENT
 END
 
+-- Loop inserts one row at a time, so count the table instead of using @@ROWCOUNT
+SET @StepRows = (SELECT COUNT(*) FROM #BasePeriod)
+PRINT CONCAT('INSERT #BasePeriod (loop): ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
 CREATE TABLE #BasePeriodDatePriorCommonTable ([BasePeriodDatePrior] DATE)
+
+SET @StepStart = SYSDATETIME()
 
 INSERT INTO #BasePeriodDatePriorCommonTable
 SELECT TOP 1 [BasePeriodDatePrior] FROM #BasePeriod group by [BasePeriodDatePrior] HAVING COUNT(*) = 4
 OPTION (RECOMPILE)
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #BasePeriodDatePriorCommonTable: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
 DECLARE @BasePeriodDatePriorCommon DATE = (SELECT TOP 1 [BasePeriodDatePrior] FROM #BasePeriodDatePriorCommonTable)
+
+-- ==== TEMP TABLE NO LONGER UTILIZED: #BasePeriodDatePriorCommonTable
 
 DECLARE @YearQtr1 INT = (SELECT    MIN([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM #BasePeriod)
 DECLARE @YearQtr2 INT = (SELECT TOP 1 ([BasePeriodDatePriorYear] * 10 + [BasePeriodDatePriorQtr]) FROM #BasePeriod 
@@ -199,8 +380,6 @@ PRINT '[Account].[TaxRateExpAnchorReserveCalcRun] Calculate'
 PRINT ''
 PRINT '@AnchorEmployerID           : ' + CAST(@AnchorEmployerID   AS VARCHAR)
 PRINT '@FiscalYear                 : ' + CAST(@FiscalYear         AS VARCHAR)
-PRINT ''
-
 PRINT ''
 PRINT '@NumberOfYears              : ' + CAST(@NumberOfYears   AS VARCHAR)
 PRINT ''
@@ -288,69 +467,6 @@ CREATE TABLE #ttAcquistions
     --[EmpFormReviewRulesCreated] DATETIME2(2),
     --[EmployerFormReviewRulesId] BIGINT,
 )
-CREATE TABLE #ttAcquistionsNotPendApp 
-(
-    [RecType]               SMALLINT, 
-    --[BaseType]              CHAR,
-
-    -- [Account].[Acquisition]
-    [AnchorEmployerId]      INT,
-    [AcquisitionID]         BIGINT,
-    [SuccessorEmployerID]   INT, 
-    [PredecessorEmployerID] INT, 
-    [AcquisitionDate]       DATE,
-    [AcquisitionCreated]    DATETIME2,
-    [SutaCutoffYear]        SMALLINT,
-    [ExperienceTransferID]  BIGINT,
-    [FormApplicationId]     BIGINT,
-
-    -- Foreign Tables
-    [TransferType]          VARCHAR(100) COLLATE DATABASE_DEFAULT,
-    [IsPartial]             BIT,
-
-    -- Stat Det - Liability Status - CURRENT
-    [SuccCurLiaStat]        VARCHAR(100) COLLATE DATABASE_DEFAULT,
-    [PredCurLiaStat]        VARCHAR(100) COLLATE DATABASE_DEFAULT,
-
-    -- Processing Status 
-
-    [ProcStatEffDt]         DATE,
-    [ProcessCode]           VARCHAR(200) COLLATE DATABASE_DEFAULT,
-    [ProcessStatusCode]     VARCHAR(200) COLLATE DATABASE_DEFAULT,
-    [ProcStatID]            BIGINT,
-    [ProcStatCreated]       DATETIME2,
-
-    [ProcStatOrder]         BIGINT,
-    [ProcStatRank]          BIGINT,
-
-    [SuccLiaEffDate]         DATE,
-    [SuccLiaStatus]          VARCHAR (100) COLLATE DATABASE_DEFAULT,
-    [SuccLiabilityDate]      DATE,
-    [SuccFirstLiabilityDate] DATE,
-
-    [PredLiaEffDate]         DATE,
-    [PredLiaStatus]          VARCHAR (100) COLLATE DATABASE_DEFAULT,
-    [PredLiabilityDate]      DATE,
-    [PredFirstLiabilityDate] DATE,
-
-    [NavLevel]               INT,
-    [NavPath]                VARCHAR(MAX) COLLATE DATABASE_DEFAULT,
-
-    [CurrentStatusExclude]   VARCHAR(MAX) COLLATE DATABASE_DEFAULT
-
-
-    ---- Data Filled in from Employer Portal in Application Code
-    --[AppFormType]               VARCHAR (100),
-    --[FormReviewAction]          VARCHAR (100),  
-    --[ResponseDate]              DATETIME2(2),   -- Submission date of the approval
-    --[IsSystemDecision]          BIT,            -- 0 ==> indicates it was a manual process that updated.
-
-    ------ Timely:: 
-    --[DayCntAcqDtToResponse]     INT,           
-    --[EmpFormReviewRuleRank]     BIGINT,
-    --[EmpFormReviewRulesCreated] DATETIME2(2),
-    --[EmployerFormReviewRulesId] BIGINT,
-)
 
 /*
 Get all the ttAcq records in whech the predecessor is a successor. Walk through all the records, 
@@ -358,7 +474,9 @@ if walking through the list starts you find a predecessor that was already fopun
 */
 
 
--- Anchor as successor - [RecType] = 0
+-- Anchor as successor - [RecType] = 0 -- INSERT #ttAcquistions
+SET @StepStart = SYSDATETIME()
+
 ;WITH AnchorAcq AS
 (
     -- Your filtered dataset
@@ -512,7 +630,12 @@ LEFT  JOIN #PartialTransferTypes          AS ttPartialTransferTypes ON ttPartial
 ) AS ttProcessStatus
 OPTION (MAXRECURSION 32767);
 
--- Anchor as predessor - [RecType] = 0
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #ttAcquistions (Anchor as Successor): ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- Anchor as predessor - [RecType] = 0 -- INSERT #ttAcquistions
+SET @StepStart = SYSDATETIME()
+
 ;WITH AnchorAcq AS
 (
     -- Your filtered dataset
@@ -654,9 +777,17 @@ LEFT  JOIN #PartialTransferTypes          AS ttPartialTransferTypes ON ttPartial
 ) AS ttProcessStatus
 OPTION (MAXRECURSION 32767);
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #ttAcquistions (Anchor as Predecessor): ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- ==== TEMP TABLE NO LONGER UTILIZED: #ValidTransferTypes
+-- ==== TEMP TABLE NO LONGER UTILIZED: #PartialTransferTypes
+
 -- UPDATE -- If the current status of a [PredecessorEmployerID] is NOT IN ('ACTIVE', 'REACTIVATED', 'INACTIVE', 'TERMINATED')
 -- PredCurLiaStat NOT IN ('ACTIVE', 'REACTIVATED', 'INACTIVE', 'TERMINATED')
-UPDATE TT SET 
+SET @StepStart = SYSDATETIME()
+
+UPDATE TT SET
   TT.[CurrentStatusExclude] = ttNotActInActTermList.[CurrentStatusExclude]
 FROM #ttAcquistions TT
 INNER JOIN 
@@ -668,8 +799,13 @@ INNER JOIN
 ) AS ttNotActInActTermList ON ttNotActInActTermList.[AnchorEmployerId] = TT.[AnchorEmployerId]
 OPTION (RECOMPILE);
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('UPDATE #ttAcquistions [CurrentStatusExclude]: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
 -- REMOVE: SuccessorEmployerID or PredecessorEmployerID if in [CurrentStatusExclude]
 -- Will Exclude if not in NOT IN ('ACTIVE', 'REACTIVATED', 'INACTIVE', 'TERMINATED')
+SET @StepStart = SYSDATETIME()
+
 DELETE A
 FROM #ttAcquistions AS A
 CROSS APPLY STRING_SPLIT(A.[CurrentStatusExclude], ',') AS ttExclude
@@ -679,40 +815,82 @@ WHERE
     OR TRY_CAST(ttExclude.value AS INT) = A.[PredecessorEmployerID]
 OPTION (RECOMPILE);
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('DELETE #ttAcquistions predecessor not valid: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
 -- #ttAcqEmployers will include the employers that we will be processed
 CREATE TABLE #ttAcqEmployers 
 (
+     -- EmployerID that of the Employer being Rated
      [AnchorEmployerId]                 INT
+
+     -- Account.Acquisition ID linking the Successor/Predecessor (NULL for the Anchor's own row)
     ,[AcquisitionID]                    BIGINT
+
+     -- Effective date of the acquisition (used to derive FirstYearFy for partial transfers)
     ,[AcquisitionDate]                  DATE
+
+     -- SUTA cutoff year from the Acquisition record
     ,[SutaCutoffYear]                   SMALLINT
+
+     -- UTC date/time the Acquisition record was created
     ,[AcquisitionCreated]               DATETIME2(2)
+
+     -- Experience transfer type code (UC86, SUTAFULL, SUTAPARTIAL)
     ,[TransferType]                     VARCHAR(100) COLLATE DATABASE_DEFAULT
+
+     -- 1 = Partial transfer (TransferType in #PartialTransferTypes), 0 = Full transfer / Anchor row
     ,[IsPartial]                        BIT
 
+     -- EmployerID that acquired the Predecessor (NULL for the Anchor's own row)
     ,[SuccessorEmployerID]              INT
+
+     -- EmployerID being acquired by the Successor (set to the Anchor EmployerID for the Anchor's own row)
     ,[PredecessorEmployerID]            INT
+
+     -- Depth of the acquisition chain from the Anchor (count of commas in NavPath; NULL for the Anchor's own row)
     ,[NavLevel]                         INT
+
+     -- Comma-delimited chain of SuccessorEmployerIDs walked from the Anchor, e.g. ',123,456,' (prevents re-walking)
     ,[NavPath]                          VARCHAR(MAX) COLLATE DATABASE_DEFAULT
 
     -- Processing Parameters
+     -- First fiscal year the experience counts: YEAR(AcquisitionDate) + 1 if partial, else @FiscalYear
     ,[FirstYearFy]                               SMALLINT
+
+     -- Fiscal year being rated (@FiscalYear)
     ,[FiscalYear]                                SMALLINT
+
+     -- February bill statement mailing date for FiscalYear (used for payroll wages)
     ,[FebMailingDate]                            DATE
+     -- February bill statement mailing cutoff date for FiscalYear
     ,[FebMailingDateCutoff]                      DATE
+
+     -- February bill statement mailing date for FiscalYear - 1 (used for payroll wages)
     ,[FebMailingDatePrior]                       DATE
+     -- February bill statement mailing cutoff date for FiscalYear - 1
     ,[FebMailingDateCutoffPrior]                 DATE
 
+
+     -- Receipts must have an EffectiveDate on or before this date (Jan 31 of FiscalYear)
     ,[RcptEffCutoffDate]                         DATE
+     -- Receipt allocations must be created before this UTC time (FebMailingDateCutoff, local to UTC)
     ,[RcptCreatedCutoffUtc]                      DATETIME2(2)
+
+     -- Benefit charges must be created before this UTC time (Jan 1 of FirstYearFy, local to UTC)
     ,[MaxPriorYearBenChgCreatedCutoffUtcFY]      DATETIME2(2)
+     -- Start of the prior-year benefit charge window, as a UTC time (Jan 1 of FirstYearFy - 1, local to UTC)
     ,[MaxPriorYearBenChgCreatedCutoffUtcFYPrior] DATETIME2(2)
+
+     -- Tax quarter reports must be created before this UTC time (FebMailingDateCutoff, local to UTC)
     ,[TaxQtrCreatedCutoffUtc]                    DATETIME2(2)
 )
 
 -- PredecessorEmployerID is the employer that is being acquired by the SuccessorEmployerID
+SET @StepStart = SYSDATETIME()
+
 INSERT INTO #ttAcqEmployers
-SELECT DISTINCT 
+SELECT DISTINCT
      ttAcquistions.[AnchorEmployerId]
     ,ttAcquistions.[AcquisitionID]
     ,ttAcquistions.[AcquisitionDate]
@@ -743,7 +921,12 @@ SELECT DISTINCT
   WHERE 1=1
 OPTION (RECOMPILE)
 
--- [Account].[Employer] -- The Aanchor employer data 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #ttAcqEmployers (acquisitions): ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- [Account].[Employer] -- The Aanchor employer data
+SET @StepStart = SYSDATETIME()
+
 INSERT INTO #ttAcqEmployers
 SELECT 
      ttEmp.[EmployerID] -- [AnchorEmployerId]
@@ -780,6 +963,9 @@ WHERE 1=1
     AND (ttEmp.[EmployerID] = @AnchorEmployerID)
 OPTION (RECOMPILE)
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #ttAcqEmployers (Anchor): ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
 -- Employer Status Determination -- The current status of the employer
 CREATE TABLE #EmpolyerSD
 (
@@ -795,6 +981,8 @@ CREATE TABLE #EmpolyerSD
     ,StatDetRank              BIGINT
     ,StatDetOrder             BIGINT
 )
+
+SET @StepStart = SYSDATETIME()
 
 ;WITH CTE_SuccSD AS (
     SELECT 
@@ -901,11 +1089,16 @@ CREATE TABLE #EmpolyerSD
             ,ttSDRank.[FinMeth]
     ) AS ttStatus
 ) -- CTE_SuccSD
-INSERT INTO #EmpolyerSD 
+INSERT INTO #EmpolyerSD
 SELECT * FROM CTE_SuccSD
 OPTION (RECOMPILE);
 
--- Rank the Acquistions.... 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #EmpolyerSD: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- Rank the Acquistions....
+SET @StepStart = SYSDATETIME()
+
 INSERT INTO #ttAcquistions
 SELECT 
     ttAcqRecType_1.*
@@ -1037,30 +1230,40 @@ order by
 
 OPTION (RECOMPILE);
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #ttAcquistions (rank by Process Status): ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- ==== TEMP TABLE NO LONGER UTILIZED: #EmpolyerSD
+
 -- Process Statuses 
 -- -- PENDING PENDINGUI PENDINGER 
 -- -- APPROVED 
 -- -- CANCELLED
 -- -- DENIED DENIEDUI DENIEDER
 
--- Keep the most recent APPROVED Process Status 
-DELETE FROM #ttAcquistions 
+-- Keep the most recent APPROVED Process Status
+SET @StepStart = SYSDATETIME()
+
+DELETE FROM #ttAcquistions
 WHERE [RecType] = 0 OR ([RecType] = 1 AND [ProcStatRank] != 1) --OR [ProcessStatusCode] NOT IN  ('APPROVED', 'PENDING', 'PENDINGUI', 'PENDINGER')
 OPTION (RECOMPILE);
 
--- Hold Onto Not Pending or Approved 
-INSERT INTO #ttAcquistionsNotPendApp
-SELECT * FROM #ttAcquistions
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('DELETE #ttAcquistions (RecType 0 / not latest Process Status): ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- Keep the most recent APPROVED Process Status
+SET @StepStart = SYSDATETIME()
+
+DELETE FROM #ttAcquistions
 WHERE [ProcessStatusCode] NOT IN  ('APPROVED', 'PENDING', 'PENDINGUI', 'PENDINGER')
 OPTION (RECOMPILE);
 
--- Keep the most recent APPROVED Process Status 
-DELETE FROM #ttAcquistions 
-WHERE [ProcessStatusCode] NOT IN  ('APPROVED', 'PENDING', 'PENDINGUI', 'PENDINGER')
-OPTION (RECOMPILE);
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('DELETE #ttAcquistions (not APPROVED / PENDING): ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
 
+-- Re-Rank the Acquistions....
+SET @StepStart = SYSDATETIME()
 
--- Re-Rank the Acquistions.... 
 INSERT INTO #ttAcquistions
 SELECT 
     0 AS [RecType],
@@ -1137,15 +1340,23 @@ SELECT
 FROM #ttAcquistions
 OPTION (RECOMPILE);
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #ttAcquistions (re-rank): ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
 -- Set the SUTA Cutoff Date on temp table #ttAcquistions
+SET @StepStart = SYSDATETIME()
 
 UPDATE TT SET
      [SutaCutoffYear] = CAST(YEAR(TT.[AcquisitionDate]) AS SMALLINT) + 3
-FROM #ttAcquistions      AS TT 
+FROM #ttAcquistions      AS TT
 WHERE 1=1
   AND TT.[TransferType] = @TransferTypeSUTAFULL
   AND TT.[SutaCutoffYear] != CAST(YEAR(TT.[AcquisitionDate]) AS SMALLINT) + 3
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('UPDATE #ttAcquistions [SutaCutoffYear]: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+SET @StepStart = SYSDATETIME()
 
 DELETE TT
 FROM #ttAcqEmployers TT
@@ -1154,15 +1365,24 @@ WHERE 1=1
   AND NOT EXISTS ( SELECT 1 FROM #ttAcquistions XX WHERE XX.[AcquisitionID] = TT.[AcquisitionID])
 OPTION (RECOMPILE);
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('DELETE #ttAcqEmployers (acquisition removed): ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
 
-UPDATE TT SET 
+SET @StepStart = SYSDATETIME()
+
+UPDATE TT SET
     TT.[FirstYearFy]  = CASE WHEN TT.[IsPartial] = 1 THEN YEAR(TT.[AcquisitionDate]) + 1 ELSE @FiscalYear END,
     TT.[FiscalYear]   = @FiscalYear
 FROM #ttAcqEmployers TT;
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('UPDATE #ttAcqEmployers [FirstYearFy] / [FiscalYear]: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
 -- [FebMailingDate] and [FebMailingDatePrior] --- USED FOR PAYROLL WAGES
 -- [RcptCreatedCutoffUtc], [MaxPriorYearBenChgCreatedCutoffUtcFY], [MaxPriorYearBenChgCreatedCutoffUtcFYPrior]
-UPDATE TT SET 
+SET @StepStart = SYSDATETIME()
+
+UPDATE TT SET
     TT.[FebMailingDate]            = @FebMailingDate,
     TT.[FebMailingDatePrior]       = @FebMailingDatePrior,
     TT.[FebMailingDateCutoff]      = @FebMailingDateCutoff,
@@ -1179,8 +1399,13 @@ UPDATE TT SET
         CAST(CAST(@FebMailingDateCutoff                       AS DATETIME2(2)) AT TIME ZONE @LocalTimeZone AT TIME ZONE 'UTC' AS DATETIME2(2))
 FROM #ttAcqEmployers TT;
 
--- #0 OUTPUT DATA RESULT SET (KEEP IN ORDER):  @ttAcquistions -- Done at beginning ============================================================
-SELECT DISTINCT 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('UPDATE #ttAcqEmployers processing parameters: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- #0 OUTPUT DATA RESULT SET (KEEP IN ORDER):  #ttAcquistions -- Done at beginning ============================================================
+SET @StepStart = SYSDATETIME()
+
+SELECT DISTINCT
      ttTaxRateExpAcquisition.[AcquisitionID]            AS [AcquisitionID]
     ,ttTaxRateExpAcquisition.[AcquisitionDate]          AS [AcquisitionDate]
     ,ttTaxRateExpAcquisition.[SutaCutoffYear]           AS [SutaCutoffYear]
@@ -1217,26 +1442,24 @@ SELECT DISTINCT
     ,ttTaxRateExpAcquisition.[PredLiabilityDate]        AS [PredLiabilityDate]
     ,ttTaxRateExpAcquisition.[PredFirstLiabilityDate]   AS [PredFirstLiabilityDate]
 
-FROM #ttAcquistions AS ttTaxRateExpAcquisition 
+FROM #ttAcquistions AS ttTaxRateExpAcquisition
 WHERE 1=1
     AND ttTaxRateExpAcquisition.[ProcStatRank] = 1
--- #0 OUTPUT DATA RESULT SET (KEEP IN ORDER):  @ttAcquistions -- Done at beginning ============================================================
 
--- Keep the most recent ('APPROVED', 'PENDING', 'PENDINGUI', 'PENDINGER') Process Status 
-INSERT INTO #ttAcquistionsNotPendApp
-SELECT * FROM #ttAcquistions
-WHERE [ProcessStatusCode] NOT IN  ('APPROVED', 'PENDING', 'PENDINGUI', 'PENDINGER')
-OPTION (RECOMPILE);
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('RESULT SET #0 Acquisitions: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
 
+---- Keep the most recent ('APPROVED', 'PENDING', 'PENDINGUI', 'PENDINGER') Process Status 
+--DELETE FROM #ttAcquistions 
+--WHERE [ProcessStatusCode] NOT IN  ('APPROVED', 'PENDING', 'PENDINGUI', 'PENDINGER')
+--OPTION (RECOMPILE);
 
--- Keep the most recent ('APPROVED', 'PENDING', 'PENDINGUI', 'PENDINGER') Process Status 
-DELETE FROM #ttAcquistions 
-WHERE [ProcessStatusCode] NOT IN  ('APPROVED', 'PENDING', 'PENDINGUI', 'PENDINGER')
-OPTION (RECOMPILE);
-
+-- ==== TEMP TABLE NO LONGER UTILIZED: #ttAcquistions
 
 -- [Account].[TaxRateExpTaxesPaid] -- All Wages for  { Successor, FULL Predecessor }, Aquistion Year Wages for {Partial Predecessor} 
-MERGE INTO [Account].[TaxRateExpTaxesPaid] AS TARGET 
+SET @StepStart = SYSDATETIME()
+
+MERGE INTO [Account].[TaxRateExpTaxesPaid] AS TARGET
 USING (
 SELECT 
      CTE_TaxesPaid.[EmployerID] 
@@ -1400,8 +1623,13 @@ THEN
     DELETE
 OPTION (MAXDOP 1); -- Example: Force single-threaded execution
 
--- [Account].[TaxRateExpBenChg] -- All Charges for  { Successor, FULL Predecessor }, Aquistion Year Charges for {Partial Predecessor} 
-MERGE INTO [Account].[TaxRateExpBenChg] AS TARGET 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('MERGE [Account].[TaxRateExpTaxesPaid]: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- [Account].[TaxRateExpBenChg] -- All Charges for  { Successor, FULL Predecessor }, Aquistion Year Charges for {Partial Predecessor}
+SET @StepStart = SYSDATETIME()
+
+MERGE INTO [Account].[TaxRateExpBenChg] AS TARGET
 USING (
 SELECT 
      ttChgStmnt.[EmployerID]   AS [EmployerID]
@@ -1513,18 +1741,8 @@ THEN
     DELETE
 OPTION (MAXDOP 1); -- Example: Force single-threaded execution
 
-
-
-/*
-
-The checking for late reports in building [Account].[TaxRateExpReserveCalc] it only checks on quarters on the base period.
-- need to look at all quarters back to the liability date. 
-
-QUICK FIX - Look at all Quarters back to Liability Date And if employer was active in any of those quarters
-            the quarter needs to have filed an Tax Quarter Report - QWR / QWRA
-
-*/
-
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('MERGE [Account].[TaxRateExpBenChg]: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
 
 DECLARE @FirstDayOfYear DATE = DATEADD(DAY,-1, DATEFROMPARTS(@FiscalYear, 1, 1));
 
@@ -1549,15 +1767,22 @@ CREATE TABLE #EmplStatDet
     [LiaStatusOrder]            BIGINT          NOT NULL
 );
 
+SET @StepStart = SYSDATETIME()
+
 INSERT INTO #EmplStatDet
-SELECT f.* 
+SELECT f.*
 FROM [Account].[fn_StatusDeterminationFlattened_ForEmployer](@AnchorEmployerID) AS f
 WHERE f.[EffDt] <= @FirstDayOfYear AND f.[EffEndDt] >= @FirstDayOfYear AND f.[EffDtRank] = 1
+
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #EmplStatDet: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
 
 DECLARE @LiabilityDateLate DATE = 
         (SELECT TOP 1 f.LiabilityDate
             FROM #EmplStatDet AS f
             WHERE f.[EffDt] <= @FirstDayOfYear AND f.[EffEndDt] >= @FirstDayOfYear AND f.[EffDtRank] = 1)
+
+SET @StepStart = SYSDATETIME()
 
 ;WITH CTE_TaxQuarters AS (
 SELECT 
@@ -1702,6 +1927,13 @@ GROUP BY
     ,CTE_ClampedOverlap.IsEnabled
     ,CTE_ClampedOverlap.[ClampedStart]
     ,CTE_ClampedOverlap.[ClampedEnd]
+
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('SELECT INTO #TaxQuartersQwrQwraLateStatus: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- ==== TEMP TABLE NO LONGER UTILIZED: #EmplStatDet
+
+SET @StepStart = SYSDATETIME()
 
 MERGE INTO [Account].[TaxRateExpPayRoll] AS TARGET -- [TaxRateExpPayRoll] Employer and Full Transfers -- [IsPartial] = 0 AND [IsPartial] = 1
 USING (
@@ -1874,6 +2106,8 @@ THEN
     DELETE
 OPTION (MAXDOP 1); -- Example: Force single-threaded execution
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('MERGE [Account].[TaxRateExpPayRoll]: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
 
 -- We only want to do this for the ANCHOR Employer
 
@@ -1882,7 +2116,6 @@ DECLARE @MaxPriorYearBenChgCreatedCutoffUtcFY  DATETIME2(2) = CAST(CAST(DATEFROM
 
 DECLARE @TaxQtrCreatedCutoffUtc        DATETIME2(2) = CAST(CAST(@FebMailingDateCutoff AS DATETIME2(2)) AT TIME ZONE @LocalTimeZone AT TIME ZONE 'UTC' AS DATETIME2(2))
 DECLARE @StatDetCreatedCutoffUtc       DATETIME2(2) = CAST(CAST(@FebMailingDateCutoff AS DATETIME2(2)) AT TIME ZONE @LocalTimeZone AT TIME ZONE 'UTC' AS DATETIME2(2))
-
 
 DECLARE @RcptCreatedCutoffUtcPrior     DATETIME2(2)             = CAST(CAST(@FebMailingDateCutoffPrior             AS DATETIME2(2)) AT TIME ZONE @LocalTimeZone AT TIME ZONE 'UTC' AS DATETIME2(2))
 DECLARE @MaxPriorYearBenChgCreatedCutoffUtcFYPrior DATETIME2(2) = CAST(CAST(DATEFROMPARTS(@FiscalYear - 1, 01, 01) AS DATETIME2(2)) AT TIME ZONE @LocalTimeZone AT TIME ZONE 'UTC' AS DATETIME2(2))
@@ -1894,7 +2127,11 @@ BEGIN
     SET @AnyLateMissingReports = 1;
 END;
 
+-- ==== TEMP TABLE NO LONGER UTILIZED: #TaxQuartersQwrQwraLateStatus
+
 -- building [Account].[TaxRateExpReserveCalc]
+SET @StepStart = SYSDATETIME()
+
 ;WITH CTE_OrderedStatDet AS (
 SELECT 
      [StatusDeterminationID]
@@ -2880,7 +3117,12 @@ THEN
     DELETE
 OPTION (MAXDOP 1); -- Example: Force single-threaded execution
 
-CREATE TABLE #MissingIds 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('MERGE [Account].[TaxRateExpReserveCalc]: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- ==== TEMP TABLE NO LONGER UTILIZED: #BasePeriod
+
+CREATE TABLE #MissingIds
 (
      [EmployerId]                   INT
     ,[FiscalYear]                   SMALLINT
@@ -2924,6 +3166,8 @@ CREATE TABLE #MissingIds
     ,[TotalPayRollTimelyYear3]      MONEY                 NULL
     ,[TotalPayRollYear3]            MONEY                 NULL
 )
+
+SET @StepStart = SYSDATETIME()
 
 INSERT INTO #MissingIds
 SELECT DISTINCT
@@ -3083,6 +3327,11 @@ SELECT DISTINCT
       AND ttAcqEmployers.[AcquisitionDate] IS NULL -- ONLY ANCHOR EMPLOYER
 OPTION (RECOMPILE)
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #MissingIds: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+SET @StepStart = SYSDATETIME()
+
 INSERT INTO [Account].[TaxRateExpReserveCalc]
 (
      [AnchorEmployerID]
@@ -3206,6 +3455,11 @@ SELECT
 FROM #MissingIds AS mi
 WHERE [EmployerId] = @AnchorEmployerID
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT [Account].[TaxRateExpReserveCalc] (missing Anchor row): ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- ==== TEMP TABLE NO LONGER UTILIZED: #MissingIds
+
 -- TransferExperience
 
 CREATE TABLE #ttTransExp 
@@ -3265,6 +3519,7 @@ CREATE TABLE #ttTransExp
 )
 
 -- Employer and Full Transfer Experience -- [IsPartial] = 0
+SET @StepStart = SYSDATETIME()
 
 INSERT INTO #ttTransExp
 SELECT -- ttTransferExpData
@@ -3511,7 +3766,11 @@ GROUP BY
     [Year2],
     [Year3]
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #ttTransExp (Employer / FULL transfers): ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
 -- Partial Transfer Experience -- [IsPartial] = 1
+SET @StepStart = SYSDATETIME()
 
 INSERT INTO #ttTransExp
 SELECT -- ttTransferExpData
@@ -3770,7 +4029,12 @@ GROUP BY
     [Year2],
     [Year3]
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #ttTransExp (PARTIAL transfers): ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
 -- MISSING ACQUISTION DATA
+SET @StepStart = SYSDATETIME()
+
 INSERT INTO #ttTransExp
 SELECT -- ttTransferExpData
     ttAcqEmployers.[AnchorEmployerId],
@@ -3832,13 +4096,23 @@ WHERE 1=1
 --WHERE 1=1
 --  AND ttTransExp.[AnchorEmployerId] IS NULL
 
--- #ttTransExp SET RESERVE 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #ttTransExp (missing acquisition data): ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- #ttTransExp SET RESERVE
+SET @StepStart = SYSDATETIME()
+
 UPDATE  TT SET
     TT.[Reserve]      = TT.[TaxesPaid]      - (TT.[BenefitsChargedClient]      - TT.[BenefitsRelievedClient]),
     TT.[PriorReserve] = TT.[TaxesPaidPrior] - (TT.[BenefitsChargedClientPrior] - TT.[BenefitsRelievedClientPrior])
 FROM #ttTransExp AS TT
 
--- #ttTransExp Set [ClientTaxablePayroll] 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('UPDATE #ttTransExp [Reserve] / [PriorReserve]: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- #ttTransExp Set [ClientTaxablePayroll]
+SET @StepStart = SYSDATETIME()
+
 UPDATE  TT SET
     TT.[ClientTaxablePayroll] =
     CASE WHEN  TT.[IsPartial] = 0  THEN 0.00 
@@ -3856,15 +4130,23 @@ UPDATE  TT SET
             END
 FROM #ttTransExp AS TT
 
--- #ttTransExp Set [PercentTransfer] 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('UPDATE #ttTransExp [ClientTaxablePayroll]: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- #ttTransExp Set [PercentTransfer]
+SET @StepStart = SYSDATETIME()
+
 UPDATE  TT SET
     TT.[PercentTransfer] =
         CASE WHEN TT.[IsPartial] = 0                                                  THEN 1.00  
             WHEN TT.[TaxablePayRoll]       IS NULL OR [TaxablePayRoll]       <  0.00 THEN 0.00 
             WHEN TT.[ClientTaxablePayroll] IS NULL OR [ClientTaxablePayroll] <= 0.00 THEN 0.00 
             WHEN TT.[ClientTaxablePayroll] > [TaxablePayRoll]                        THEN 1.00 
-            ELSE TT.[ClientTaxablePayroll] / [TaxablePayRoll] END 
+            ELSE TT.[ClientTaxablePayroll] / [TaxablePayRoll] END
 FROM #ttTransExp AS TT
+
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('UPDATE #ttTransExp [PercentTransfer]: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
 
 CREATE TABLE #ttTransExpPayroll
 (
@@ -3886,6 +4168,8 @@ CREATE TABLE #ttTransExpPayroll
     [TotalPayRoll]                    MONEY
 
 )
+
+SET @StepStart = SYSDATETIME()
 
 INSERT INTO #ttTransExpPayroll
 SELECT -- [Account].[TaxRateExpPayRoll]
@@ -3912,21 +4196,45 @@ INNER JOIN [Account].[TaxRateExpPayRoll] AS ttData ON ttData.[AnchorEmployerID] 
         AND ttAcqEmployers.[IsPartial]   = 0
         AND ttData.[EmployerID]          = ttAcqEmployers.[PredecessorEmployerID]
 
--- #1 DATA (KEEP IN ORDER):  TransferExperience 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('INSERT #ttTransExpPayroll: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- #1 DATA (KEEP IN ORDER):  TransferExperience
+SET @StepStart = SYSDATETIME()
+
 SELECT * FROM #ttTransExp
 
--- #2 DATA (KEEP IN ORDER):  TransferExperiencePayroll 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('RESULT SET #1 TransferExperience: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- ==== TEMP TABLE NO LONGER UTILIZED ** EXCEPT FOR DEBUG ** : #ttTransExp
+
+-- #2 DATA (KEEP IN ORDER):  TransferExperiencePayroll
+SET @StepStart = SYSDATETIME()
+
 SELECT * FROM #ttTransExpPayroll
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('RESULT SET #2 TransferExperiencePayroll: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+-- ==== TEMP TABLE NO LONGER UTILIZED: #ttTransExpPayroll
+
 -- #3 DATA (KEEP IN ORDER):  RateTypeDetermined
+SET @StepStart = SYSDATETIME()
+
 SELECT distinct
      [EmployerID] -- INT
     ,[RateTypeDetermined] -- VARCHAR 100
     ,@FebMailingDateCutoff AS FebMailingDateCutoff -- DATE
-FROM [Account].[TaxRateExpReserveCalc] 
+FROM [Account].[TaxRateExpReserveCalc]
 WHERE [AnchorEmployerID] = @AnchorEmployerID AND [EmployerID] = @AnchorEmployerID AND [FiscalYear] = @FiscalYear
 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('RESULT SET #3 RateTypeDetermined: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
 -- #4 DATA (KEEP IN ORDER):  StatDetLiability
+SET @StepStart = SYSDATETIME()
+
 ;WITH CTE_OrderedStatDet AS (
     SELECT 
             [StatusDeterminationID]
@@ -4056,9 +4364,23 @@ CTE_SdLiability as (
     FROM CTE_OrderedStatDet AS ttPrevStatus
     JOIN CTE_FirstCovEffDate ttFirstCovEffDate ON ttPrevStatus.[EmployerID] = ttFirstCovEffDate.[EmployerID]
 )
-SELECT * FROM CTE_SdLiability  
+SELECT * FROM CTE_SdLiability
+
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('RESULT SET #4 StatDetLiability: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
 
 -- #5 DATA (KEEP IN ORDER):  TaxRateHawaii
+-- Returns the [Account].[TaxRateHawaii] rows for every employer in #ttAcqEmployers:
+--   1. the Anchor employer            (joined on [AnchorEmployerId])
+--   2. each Successor employer        (joined on [SuccessorEmployerID])
+--   3. each Predecessor employer      (joined on [PredecessorEmployerID]; also covers the Anchor's own row)
+-- A row is returned when its [FiscalYear] is either:
+--   - the Fiscal Year being rated (ttAcqEmployers.[FiscalYear]), OR
+--   - for acquisition rows ([AcquisitionDate] IS NOT NULL), the calendar year of the Acquisition Date
+-- The three sets are combined with UNION ALL, and the outer SELECT DISTINCT removes duplicate rows
+-- (e.g. the Anchor matched as both Anchor and Predecessor, or an employer that is in more than one acquisition).
+SET @StepStart = SYSDATETIME()
+
 SELECT DISTINCT ttTaxRateHawaii.*
 FROM (
     SELECT DISTINCT [TaxRateHawaii].*
@@ -4088,94 +4410,115 @@ FROM (
 
 ) AS ttTaxRateHawaii
 
--- 
-SELECT * FROM #ttTransExp;
-SELECT 
+SET @StepRows = @@ROWCOUNT
+PRINT CONCAT('RESULT SET #5 TaxRateHawaii: ', DATEDIFF(MILLISECOND, @StepStart, SYSDATETIME()), ' ms, ', @StepRows, ' rows')
+
+PRINT CONCAT('TOTAL elapsed: ', DATEDIFF(MILLISECOND, @ProcStart, SYSDATETIME()), ' ms')
+
+-- ==== TEMP TABLE NO LONGER UTILIZED ** EXCEPT FOR DEBUG ** : #ttAcqEmployers
+
+--
+IF @Show_Debug_Data = 'Y'
+BEGIN
+
+    /*  for #ttTransExp -- the data for TaxesPaid and TaxesPaidPrior are for Emplyers in ttAcqEmployers
+        what is 
+
+    */
+
+    EXECUTE [Account].[RunningReserveCalculate] @ParamEmployerID = @ParamEmployerID, @ParamUser = 63005
+    SELECT * FROM [Account].[RunningReserve] WHERE [EmployerID] = @ParamEmployerID
+
+    SELECT 
 
 
-   PriorReserve = ISNULL(TaxesPaidPrior, 0.00) - 
-                  (ISNULL(BenefitsChargedClientPrior, 0.00) - ISNULL(BenefitsRelievedClientPrior, 0.00)) +  -- BenefitsTotalClientPrior
-                  ISNULL(BenefitsTotalClientPriorAdjust, 0.00),                                             -- BenefitsTotalClientPriorAdjust
+       PriorReserve = ISNULL(TaxesPaidPrior, 0.00) - 
+                      (ISNULL(BenefitsChargedClientPrior, 0.00) - ISNULL(BenefitsRelievedClientPrior, 0.00)) +  -- BenefitsTotalClientPrior
+                      ISNULL(BenefitsTotalClientPriorAdjust, 0.00),                                             -- BenefitsTotalClientPriorAdjust
 
-   Contributions = ISNULL(TaxesPaid, 0.00),
+       Contributions = ISNULL(TaxesPaid, 0.00),
 
-
-   Reserve       = ISNULL(TaxesPaid, 0.00) - 
-                   (ISNULL(BenefitsChargedClient, 0.00) - ISNULL(BenefitsRelievedClient, 0.00)) + -- BenefitsTotalClient
-                   ISNULL(BenefitsTotalClientAdjust, 0.00),                                       -- BenefitsTotalClientAdjust
-
-   Timely3Yr    = (ISNULL(TaxablePayRollTimelyYear1, 0.00) + ISNULL(TaxablePayRollTimelyYear2, 0.00) + ISNULL(TaxablePayRollTimelyYear3, 0.00)),
-   Timely3YrAvg = (ISNULL(TaxablePayRollTimelyYear1, 0.00) + ISNULL(TaxablePayRollTimelyYear2, 0.00) + ISNULL(TaxablePayRollTimelyYear3, 0.00)) / 3.0,
-
-   '<<< VALUES' AS 'VALUES',
+       Charges       = ISNULL(BenefitsChargedClient, 0.00) - ISNULL(BenefitsRelievedClient, 0.00),
 
 
-   TaxesPaid,
-   TaxesPaidPrior,
-   BenefitsChargedClient,
-   BenefitsRelievedClient,
-   BenefitsTotalClient       = ISNULL(BenefitsChargedClient, 0.00) - ISNULL(BenefitsRelievedClient, 0.00),
+       Reserve       = ISNULL(TaxesPaid, 0.00) - 
+                       (ISNULL(BenefitsChargedClient, 0.00) - ISNULL(BenefitsRelievedClient, 0.00)) + -- BenefitsTotalClient
+                       ISNULL(BenefitsTotalClientAdjust, 0.00),                                       -- BenefitsTotalClientAdjust
 
-   BenefitsTotalClientAdjust,
-   BenefitsTotalClientAdjust = ISNULL(BenefitsTotalClientAdjust, 0.00),
+       Timely3Yr    = (ISNULL(TaxablePayRollTimelyYear1, 0.00) + ISNULL(TaxablePayRollTimelyYear2, 0.00) + ISNULL(TaxablePayRollTimelyYear3, 0.00)),
+       Timely3YrAvg = (ISNULL(TaxablePayRollTimelyYear1, 0.00) + ISNULL(TaxablePayRollTimelyYear2, 0.00) + ISNULL(TaxablePayRollTimelyYear3, 0.00)) / 3.0,
 
-   BenefitsChargedClientPrior,
-   BenefitsRelievedClientPrior,
-   BenefitsTotalClientPrior       = ISNULL(BenefitsChargedClientPrior, 0.00) - ISNULL(BenefitsRelievedClientPrior, 0.00),
+       '<<< VALUES' AS 'VALUES',
 
-   BenefitsTotalClientPriorAdjust,
-   BenefitsTotalClientPriorAdjust = ISNULL(BenefitsTotalClientPriorAdjust, 0.00),
 
-   TaxablePayRollTimelyYear1,
-   TaxablePayRollTimelyYear2,
-   TaxablePayRollTimelyYear3,
+       TaxesPaid,
+       TaxesPaidPrior,
 
-   '<<< DATA' AS 'DATA'
-FROM #ttTransExp
+       BenefitsChargedClient,
+       BenefitsRelievedClient,
+       BenefitsTotalClient       = ISNULL(BenefitsChargedClient, 0.00) - ISNULL(BenefitsRelievedClient, 0.00),
 
-SELECT -- [Account].[TaxRateExpTaxesPaid]
+       BenefitsTotalClientAdjust,
+       --BenefitsTotalClientAdjust = ISNULL(BenefitsTotalClientAdjust, 0.00),
 
-     ttData.[AnchorEmployerID]
-    ,ttData.[EmployerID]
-    ,ttData.[FiscalYear]
-    ,ttData.[Year]
-    ,ttData.[Quarter]
+       BenefitsChargedClientPrior,
+       BenefitsRelievedClientPrior,
+       BenefitsTotalClientPrior       = ISNULL(BenefitsChargedClientPrior, 0.00) - ISNULL(BenefitsRelievedClientPrior, 0.00),
 
-    ,ttData.[TaxesPaid]
-    ,ttData.[TaxesPaidPrior]
+       BenefitsTotalClientPriorAdjust,
+       --BenefitsTotalClientPriorAdjust = ISNULL(BenefitsTotalClientPriorAdjust, 0.00),
 
-    ,ttData.[AcquisitionID]
-    ,ttData.[IsPartial]
-FROM #ttAcqEmployers AS ttAcqEmployers
-LEFT JOIN [Account].[TaxRateExpTaxesPaid] AS ttData ON ttData.[AnchorEmployerID] = ttAcqEmployers.[AnchorEmployerID]
-        AND ttData.[EmployerID]        = ttAcqEmployers.[PredecessorEmployerID] 
-        AND ttAcqEmployers.[IsPartial] = 0
-WHERE  1=1
-    AND ttData.[AnchorEmployerId]  = @AnchorEmployerId 
-    AND ttData.[FiscalYear]        = ttAcqEmployers.[FiscalYear] 
-ORDER BY 
-     ttData.[AnchorEmployerID], 
-     ttData.[EmployerID],
-     ttData.[FiscalYear]
-    ,ttData.[Year]
-    ,ttData.[Quarter]
+       TaxablePayRollTimelyYear1,
+       TaxablePayRollTimelyYear2,
+       TaxablePayRollTimelyYear3,
+
+       '<<< DATA' AS 'DATA'
+    FROM #ttTransExp
+
+    SELECT -- [Account].[TaxRateExpTaxesPaid]
+         'Debug TaxesPaid' 'Debug TaxesPaid',
+         ttData.[AnchorEmployerID]
+        ,ttData.[EmployerID]
+        ,ttData.[FiscalYear]
+        ,ttData.[Year]
+        ,ttData.[Quarter]
+
+        ,ttData.[TaxesPaid]
+        ,ttData.[TaxesPaidPrior]
+
+        ,ttData.[AcquisitionID]
+        ,ttData.[IsPartial]
+    FROM #ttAcqEmployers AS ttAcqEmployers
+    LEFT JOIN [Account].[TaxRateExpTaxesPaid] AS ttData ON ttData.[AnchorEmployerID] = ttAcqEmployers.[AnchorEmployerID]
+            AND ttData.[EmployerID]        = ttAcqEmployers.[PredecessorEmployerID] 
+            AND ttAcqEmployers.[IsPartial] = 0
+    WHERE  1=1
+        AND ttData.[AnchorEmployerId]  = @AnchorEmployerId 
+        AND ttData.[FiscalYear]        = ttAcqEmployers.[FiscalYear] 
+    ORDER BY 
+         ttData.[AnchorEmployerID], 
+         ttData.[EmployerID],
+         ttData.[FiscalYear]
+        ,ttData.[Year]
+        ,ttData.[Quarter]
+END
+
+-- ==== TEMP TABLE NO LONGER UTILIZED: #ttTransExp
+-- ==== TEMP TABLE NO LONGER UTILIZED: #ttAcqEmployers
 
 ---- Session temp tables: drop if they exist from a prior run in this session
---DROP TABLE IF EXISTS #ValidTransferTypes;
---DROP TABLE IF EXISTS #PartialTransferTypes;
---DROP TABLE IF EXISTS #BasePeriod;
---DROP TABLE IF EXISTS #BasePeriodDatePriorCommonTable;
---DROP TABLE IF EXISTS #ttAcquistions;
---DROP TABLE IF EXISTS #ttAcquistionsNotPendApp;
---DROP TABLE IF EXISTS #ttAcqEmployers;
---DROP TABLE IF EXISTS #EmpolyerSD;
---DROP TABLE IF EXISTS #EmplStatDet;
---DROP TABLE IF EXISTS #TaxQuartersQwrQwraLateStatus;
---DROP TABLE IF EXISTS #MissingIds;
---DROP TABLE IF EXISTS #ttTransExp;
-
-
-
+DROP TABLE IF EXISTS #ValidTransferTypes;
+DROP TABLE IF EXISTS #PartialTransferTypes;
+DROP TABLE IF EXISTS #BasePeriod;
+DROP TABLE IF EXISTS #BasePeriodDatePriorCommonTable;
+DROP TABLE IF EXISTS #ttAcquistions;
+DROP TABLE IF EXISTS #ttAcqEmployers;
+DROP TABLE IF EXISTS #EmpolyerSD;
+DROP TABLE IF EXISTS #EmplStatDet;
+DROP TABLE IF EXISTS #TaxQuartersQwrQwraLateStatus;
+DROP TABLE IF EXISTS #MissingIds;
+DROP TABLE IF EXISTS #ttTransExp;
+DROP TABLE IF EXISTS #ttTransExpPayroll;
 
 END
 
