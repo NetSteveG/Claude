@@ -5,7 +5,7 @@
 --SET QUOTED_IDENTIFIER ON
 --GO
 
-CREATE OR ALTER   PROCEDURE [Account].[RunningReserveCalculate]
+CREATE OR ALTER PROCEDURE [Account].[RunningReserveCalculate]
     @ParamEmployerID     INT      = NULL,
     @ParamUser           INT      = NULL
 WITH RECOMPILE
